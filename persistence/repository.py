@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
-
 import aiosqlite
 
 from core.models import Fill, Order, Position
+from core.types import OrderStatus, Side
 
 
 class Repository:
@@ -22,6 +21,43 @@ class Repository:
     async def upsert_order_status(self, order_id: str, status: str, updated_at: str) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("UPDATE orders SET status=?, updated_at=? WHERE order_id=?", (status, updated_at, order_id))
+            await db.commit()
+
+    async def get_open_orders(self, market_id: str | None = None, outcome_id: str | None = None) -> list[Order]:
+        query = "SELECT order_id, market_id, outcome_id, side, price, size, status, created_at, updated_at FROM orders WHERE status IN (?,?)"
+        params: list[object] = [OrderStatus.OPEN.value, OrderStatus.PARTIAL.value]
+        if market_id:
+            query += " AND market_id=?"
+            params.append(market_id)
+        if outcome_id:
+            query += " AND outcome_id=?"
+            params.append(outcome_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(query, params)
+            rows = await cur.fetchall()
+        return [
+            Order(
+                order_id=r[0],
+                market_id=r[1],
+                outcome_id=r[2],
+                side=Side(r[3]),
+                price=float(r[4]),
+                size=float(r[5]),
+                status=OrderStatus(r[6]),
+                created_at=r[7],
+                updated_at=r[8],
+            )
+            for r in rows
+        ]
+
+    async def bulk_update_order_status(self, order_ids: list[str], status: str, updated_at: str) -> None:
+        if not order_ids:
+            return
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                "UPDATE orders SET status=?, updated_at=? WHERE order_id=?",
+                [(status, updated_at, oid) for oid in order_ids],
+            )
             await db.commit()
 
     async def insert_fill(self, f: Fill) -> None:

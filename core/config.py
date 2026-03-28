@@ -78,6 +78,8 @@ class Settings(BaseModel):
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"missing config file: {path}")
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
@@ -109,6 +111,26 @@ def load_settings() -> Settings:
         retry_backoff_min=float(os.getenv("RETRY_BACKOFF_MIN", "0.5")),
         retry_backoff_max=float(os.getenv("RETRY_BACKOFF_MAX", "8")),
     )
-    markets = MarketsConfig(**_load_yaml(Path("config/markets.yaml")))
-    risk = RiskConfig(**_load_yaml(Path("config/risk.yaml")))
-    return Settings(env=env, markets=markets, risk=risk)
+    markets_path = Path("config/markets.yaml")
+    risk_path = Path("config/risk.yaml")
+    markets = MarketsConfig(**_load_yaml(markets_path))
+    risk = RiskConfig(**_load_yaml(risk_path))
+    settings = Settings(env=env, markets=markets, risk=risk)
+    if settings.env.telegram_enabled and (not settings.env.telegram_bot_token or not settings.env.telegram_chat_id):
+        raise ValueError("TELEGRAM_ENABLED=true requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+    if settings.env.mode == BotMode.LIVE:
+        missing = [
+            name
+            for name, value in {
+                "POLYMARKET_API_KEY": settings.env.polymarket_api_key,
+                "POLYMARKET_API_SECRET": settings.env.polymarket_api_secret,
+                "POLYMARKET_PASSPHRASE": settings.env.polymarket_passphrase,
+                "POLYMARKET_PRIVATE_KEY": settings.env.polymarket_private_key,
+                "POLYMARKET_PROXY_ADDRESS": settings.env.polymarket_proxy_address,
+                "POLYMARKET_FUNDER": settings.env.polymarket_funder,
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise ValueError(f"LIVE mode requires credentials: {', '.join(missing)}")
+    return settings

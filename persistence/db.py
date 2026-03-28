@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import aiosqlite
 
 
@@ -83,6 +85,7 @@ CREATE_SQL = [
 
 
 async def init_db(path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(path) as db:
         for q in CREATE_SQL:
             await db.execute(q)

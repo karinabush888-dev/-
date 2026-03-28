@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from core.timeutils import seconds_until_next_utc_day, utc_day_key, utc_now
 from core.types import AdaptationMode, Side
@@ -19,6 +20,7 @@ class Scheduler:
         self.last_hour = None
 
     async def run(self) -> None:
+        await self._load_mode_state()
         await self.ctx.notifier.send(f"bot start mode={self.ctx.settings.env.mode.value}")
         await self._select_markets()
         while self.running:
@@ -30,15 +32,54 @@ class Scheduler:
                     await self.ctx.exec.cancel_all()
             await asyncio.sleep(self.ctx.settings.env.refresh_sec)
 
+    async def _load_mode_state(self) -> None:
+        raw = await self.ctx.repo.get_bot_state("adaptation_mode")
+        if not raw:
+            return
+        payload = json.loads(raw)
+        expires_at = payload.get("expires_at")
+        if not expires_at:
+            return
+        exp_ts = datetime.fromisoformat(expires_at)
+        if utc_now() < exp_ts:
+            self.ctx.state.stats.mode = AdaptationMode(payload.get("mode", AdaptationMode.NORMAL.value))
+
+    async def _persist_mode_state(self, mode: AdaptationMode, hours: int) -> None:
+        now = utc_now()
+        payload = {
+            "mode": mode.value,
+            "activated_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=hours)).isoformat(),
+        }
+        await self.ctx.repo.set_bot_state("adaptation_mode", json.dumps(payload))
+
+    @staticmethod
+    def _normalize_event_url(raw: str) -> str:
+        cleaned = raw.strip().lower().rstrip("/")
+        if not cleaned:
+            return cleaned
+        if "/event/" in cleaned:
+            return cleaned.split("/event/")[-1]
+        return cleaned
+
     async def _select_markets(self):
         markets = await self.ctx.exchange.fetch_markets()
+        available = {self._normalize_event_url(m.event_url): m for m in markets}
+        configured = self.ctx.settings.markets.markets
+        if len(configured) > self.ctx.settings.risk.max_open_markets:
+            raise ValueError("configured markets exceed risk.max_open_markets; refuse to auto-substitute")
         prob_min = self.ctx.settings.markets.selection["prob_min"]
         prob_max = self.ctx.settings.markets.selection["prob_max"]
-        for m in markets[: self.ctx.settings.risk.max_open_markets]:
-            out = self.ctx.selector(m, prob_min, prob_max)
-            self.ctx.state.selected_outcomes[m.market_id] = out.outcome_id
-            await self.ctx.repo.save_selected_market(m.market_id, m.name, out.outcome_id, out.label, out.implied_prob, out.volume, str(utc_now()))
-            await self.ctx.notifier.send(f"selected outcome {m.name}: {out.label} p={out.implied_prob:.2f} liq={out.volume:.0f}")
+
+        for cfg in configured:
+            target_url = cfg["event_url"]
+            market = available.get(self._normalize_event_url(target_url))
+            if market is None:
+                raise ValueError(f"configured market URL not returned by exchange: {target_url}")
+            out = self.ctx.selector(market, prob_min, prob_max)
+            self.ctx.state.selected_outcomes[market.market_id] = out.outcome_id
+            await self.ctx.repo.save_selected_market(market.market_id, market.name, out.outcome_id, out.label, out.implied_prob, out.volume, str(utc_now()))
+            await self.ctx.notifier.send(f"selected outcome {market.name}: {out.label} p={out.implied_prob:.2f} liq={out.volume:.0f}")
 
     async def _tick(self):
         now = utc_now()
@@ -49,37 +90,55 @@ class Scheduler:
 
         mids: dict[tuple[str, str], float] = {}
         positions = await self.ctx.exchange.fetch_positions()
-        for p in positions:
-            self.ctx.state.positions[(p.market_id, p.outcome_id)] = p
+        self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in positions}
+        open_orders = await self.ctx.exchange.fetch_open_orders()
 
         for market_id, outcome_id in self.ctx.state.selected_outcomes.items():
             res = await self.ctx.exchange.get_market_resolution_time(market_id)
             if self.ctx.risk_engine.near_resolution(res, self.ctx.settings.risk.pause_before_resolution_minutes):
-                await self.ctx.exec.cancel_all()
+                reason = f"near_resolution({res.isoformat() if res else 'unknown'})"
+                if self.ctx.state.blocked_markets.get(market_id) != reason:
+                    self.ctx.state.blocked_markets[market_id] = reason
+                    await self.ctx.exec.cancel_market_orders(market_id, outcome_id)
+                    await self.ctx.notifier.send(f"market {market_id} blocked: {reason}")
                 continue
+
             book = await self.ctx.exchange.fetch_orderbook(market_id, outcome_id)
             mids[(market_id, outcome_id)] = book.mid
             p = self.ctx.state.positions.get((market_id, outcome_id))
             exp = exposure_of(p) if p else 0.0
             mode_mult_mm, mode_mult_mis = self.ctx.mode_multipliers()
             sizing = self.ctx.risk_engine.dynamic_sizing(self.ctx.pnl_state["equity"], mode_mult_mm, mode_mult_mis)
-            (bside, bid), (sside, ask), reduce_only = self.ctx.mm.build_quotes(book, exp, sizing.max_exposure_per_outcome)
-            open_orders = await self.ctx.exchange.fetch_open_orders()
-            for o in open_orders:
-                if o.market_id == market_id and o.outcome_id == outcome_id:
-                    await self.ctx.exec.cancel(o.order_id)
-            if not reduce_only and exp < sizing.max_exposure_per_outcome:
-                await self.ctx.exec.place_limit(market_id, outcome_id, bside, bid, sizing.order_size_mm)
-            if (not reduce_only and exp < sizing.max_exposure_per_outcome) or (p and p.qty > 0):
-                await self.ctx.exec.place_limit(market_id, outcome_id, sside, ask, sizing.order_size_mm)
 
             self.ctx.mis.on_tick(market_id, outcome_id, book.mid)
-            sig = self.ctx.mis.detect_signal(market_id, outcome_id)
-            if sig and self.ctx.state.stats.mispricing_trades_today < self.ctx.settings.risk.max_mispricing_trades_per_day:
-                if exp < sizing.max_exposure_per_outcome:
-                    side = sig
-                    px = book.best_ask if side == Side.BUY else book.best_bid
-                    await self.ctx.exec.place_limit(market_id, outcome_id, side, px, sizing.order_size_mis)
+            for action in self.ctx.mis.manage_trade(market_id, outcome_id, book.mid):
+                px = book.best_bid if action.side == Side.SELL else book.best_ask
+                await self.ctx.exec.place_limit(market_id, outcome_id, action.side, px, action.size)
+                await self.ctx.notifier.send(f"mispricing {action.reason} market={market_id} size={action.size}")
+                if action.reason == "stop":
+                    self.ctx.state.stats.stopouts_today += 1
+
+            is_blocked = market_id in self.ctx.state.blocked_markets
+            if not is_blocked:
+                (bside, bid), (sside, ask), reduce_only = self.ctx.mm.build_quotes(book, exp, sizing.max_exposure_per_outcome)
+                for o in open_orders:
+                    if o.market_id == market_id and o.outcome_id == outcome_id:
+                        await self.ctx.exec.cancel(o.order_id)
+                if not reduce_only and exp < sizing.max_exposure_per_outcome:
+                    await self.ctx.exec.place_limit(market_id, outcome_id, bside, bid, sizing.order_size_mm)
+                if (not reduce_only and exp < sizing.max_exposure_per_outcome) or (p and p.qty > 0):
+                    await self.ctx.exec.place_limit(market_id, outcome_id, sside, ask, sizing.order_size_mm)
+
+                sig = self.ctx.mis.detect_signal(market_id, outcome_id)
+                if (
+                    sig
+                    and not self.ctx.mis.has_active_trade(market_id, outcome_id)
+                    and self.ctx.state.stats.mispricing_trades_today < self.ctx.settings.risk.max_mispricing_trades_per_day
+                    and exp < sizing.max_exposure_per_outcome
+                ):
+                    px = book.best_ask if sig == Side.BUY else book.best_bid
+                    await self.ctx.exec.place_limit(market_id, outcome_id, sig, px, sizing.order_size_mis)
+                    self.ctx.mis.start_trade(market_id, outcome_id, sig, px, sizing.order_size_mis)
                     self.ctx.state.stats.mispricing_trades_today += 1
 
         fills = await self.ctx.exchange.fetch_fills(self.last_fill_poll)
@@ -97,7 +156,6 @@ class Scheduler:
         self.ctx.pnl_state = {"equity": equity, "pnl_today": pnl_today, "pnl_mtd": pnl_mtd, "progress": progress, "drawdown": drawdown}
 
         if self.ctx.risk_engine.should_kill_switch(pnl_today, equity, self.ctx.state):
-            self.ctx.state.stats.stopouts_today += 1
             self.ctx.risk_engine.activate_pause_to_next_day(self.ctx.state)
             await self.ctx.exec.cancel_all()
             await self.ctx.notifier.send("kill switch activated; pause until next UTC day")
@@ -150,6 +208,7 @@ class Scheduler:
             mode = AdaptationMode.BRAKE
         self.ctx.state.reset_daily()
         self.ctx.state.stats.mode = mode
+        await self._persist_mode_state(mode, self.ctx.settings.risk.adaptation_window_hours)
         self.ctx.pnl_engine.reset_day(prev_equity)
         await self.ctx.notifier.send(f"new UTC day, mode={mode.value}, next reset in {seconds_until_next_utc_day()} sec")
 
