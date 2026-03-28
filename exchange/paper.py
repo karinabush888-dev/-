@@ -25,8 +25,8 @@ class PaperExchangeClient(ExchangeClient):
 
     def _seed_markets(self) -> list[Market]:
         base = [
-            ("mkt_btc", "BTC", "https://polymarket.com/ru/event/bitcoin-above-on-march-17"),
-            ("mkt_eth", "ETH", "https://polymarket.com/ru/event/ethereum-above-on-march-17"),
+            ("mkt_btc", "BTC", "https://polymarket.com/event/bitcoin-above-on-april-3"),
+            ("mkt_eth", "ETH", "https://polymarket.com/event/ethereum-above-on-april-4"),
         ]
         out: list[Market] = []
         for mid, name, url in base:

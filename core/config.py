@@ -94,7 +94,7 @@ def load_settings() -> Settings:
         raise ValueError(f"MODE must be PAPER or LIVE, got {raw_mode}")
     env = EnvConfig(
         mode=BotMode(raw_mode),
-        telegram_enabled=os.getenv("TELEGRAM_ENABLED", "true").lower() == "true",
+        telegram_enabled=os.getenv("TELEGRAM_ENABLED", "false").lower() == "true",
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         db_path=os.getenv("DB_PATH", "/app/data/bot.sqlite3"),
