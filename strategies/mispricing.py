@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from core.models import Fill, MispricingTrade
 from core.timeutils import utc_now
@@ -23,6 +23,61 @@ class MispricingStrategy:
         self.active_trades: dict[tuple[str, str], MispricingTrade] = {}
         self.pending_entry_orders: dict[str, dict[str, float | str | Side]] = {}
         self.pending_exit_orders: dict[tuple[str, str], dict[str, float | str | Side]] = {}
+
+    def serialize_active_trades(self) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        for trade in self.active_trades.values():
+            if trade.closed:
+                continue
+            out.append(
+                {
+                    "market_id": trade.market_id,
+                    "outcome_id": trade.outcome_id,
+                    "side": trade.side.value,
+                    "entry_price": trade.entry_price,
+                    "entry_ts": trade.entry_ts.isoformat(),
+                    "size": trade.size,
+                    "remaining_size": trade.remaining_size,
+                    "tp1_hit": trade.tp1_hit,
+                    "tp2_hit": trade.tp2_hit,
+                    "stop_hit": trade.stop_hit,
+                    "time_stop_hit": trade.time_stop_hit,
+                    "time_stop_deadline": trade.time_stop_deadline.isoformat() if trade.time_stop_deadline else None,
+                    "closed": trade.closed,
+                    "meta": trade.meta,
+                }
+            )
+        return out
+
+    def restore_active_trades(self, payload: list[dict[str, object]]) -> None:
+        restored: dict[tuple[str, str], MispricingTrade] = {}
+        now = utc_now()
+        for raw in payload:
+            try:
+                trade = MispricingTrade(
+                    market_id=str(raw["market_id"]),
+                    outcome_id=str(raw["outcome_id"]),
+                    side=Side(str(raw["side"])),
+                    entry_price=float(raw["entry_price"]),
+                    entry_ts=datetime.fromisoformat(str(raw["entry_ts"])),
+                    size=float(raw["size"]),
+                    remaining_size=float(raw["remaining_size"]),
+                    tp1_hit=bool(raw.get("tp1_hit", False)),
+                    tp2_hit=bool(raw.get("tp2_hit", False)),
+                    stop_hit=bool(raw.get("stop_hit", False)),
+                    time_stop_hit=bool(raw.get("time_stop_hit", False)),
+                    time_stop_deadline=datetime.fromisoformat(str(raw["time_stop_deadline"])) if raw.get("time_stop_deadline") else None,
+                    closed=bool(raw.get("closed", False)),
+                    meta=dict(raw.get("meta", {})),
+                )
+            except Exception:
+                continue
+            if trade.closed or trade.remaining_size <= 0:
+                continue
+            if trade.time_stop_deadline and trade.time_stop_deadline <= now:
+                continue
+            restored[(trade.market_id, trade.outcome_id)] = trade
+        self.active_trades = restored
 
     def on_tick(self, market_id: str, outcome_id: str, mid: float):
         key = (market_id, outcome_id)
@@ -50,6 +105,7 @@ class MispricingStrategy:
         return Side.BUY if prices[-1] > prices[0] else Side.SELL
 
     def register_entry_order(self, order_id: str, market_id: str, outcome_id: str, side: Side) -> None:
+        self.pending_exit_orders.pop((market_id, outcome_id), None)
         self.pending_entry_orders[order_id] = {"market_id": market_id, "outcome_id": outcome_id, "side": side, "placed_at_ts": utc_now().timestamp()}
 
     def register_exit_order(self, order_id: str, market_id: str, outcome_id: str, side: Side, reason: str, target_size: float) -> None:
@@ -95,6 +151,8 @@ class MispricingStrategy:
         key = (market_id, outcome_id)
         trade = self.active_trades.get(key)
         if trade is None or trade.closed or trade.remaining_size <= 0:
+            return []
+        if trade.stop_hit or trade.time_stop_hit or trade.tp2_hit:
             return []
         if self.has_pending_exit(market_id, outcome_id):
             return []
@@ -164,6 +222,7 @@ class MispricingStrategy:
             trade.size = round(trade.size + fill.size, 4)
             trade.remaining_size = round(trade.remaining_size + fill.size, 4)
             trade.entry_price = ((trade.entry_price * previous_size) + (fill.price * fill.size)) / trade.size if trade.size > 0 else trade.entry_price
+            self.pending_entry_orders.pop(fill.order_id, None)
 
         if key is None:
             key = (fill.market_id, fill.outcome_id)
@@ -196,6 +255,7 @@ class MispricingStrategy:
         if trade.remaining_size <= 0:
             trade.closed = True
             self.pending_exit_orders.pop(key, None)
+            self.active_trades.pop(key, None)
 
         return {
             "opened": opened,

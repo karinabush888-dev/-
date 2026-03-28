@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from core.config import Settings, load_settings
@@ -18,6 +19,8 @@ from services.pnl import PnLEngine
 from services.scheduler import Scheduler
 from strategies.mispricing import MispricingStrategy
 from strategies.mm import MarketMakingStrategy
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,6 +52,13 @@ class AppContext:
 async def build_context() -> AppContext:
     settings = load_settings()
     setup_logging(settings.env.log_level)
+    log.info(
+        "startup config mode=%s refresh_sec=%s db_path=%s telegram_enabled=%s",
+        settings.env.mode.value,
+        settings.env.refresh_sec,
+        settings.env.db_path,
+        settings.env.telegram_enabled,
+    )
     await init_db(settings.env.db_path)
 
     if settings.env.mode.value == "PAPER":
@@ -68,6 +78,7 @@ async def build_context() -> AppContext:
             retry_backoff_max=settings.env.retry_backoff_max,
         )
         await exchange.get_server_time()
+        log.warning("LIVE mode enabled with endpoint assumptions; validate against staging before production.")
 
     repo = Repository(settings.env.db_path)
     notifier = TelegramNotifier(settings.env.telegram_enabled, settings.env.telegram_bot_token, settings.env.telegram_chat_id)
@@ -96,4 +107,10 @@ async def build_context() -> AppContext:
         pnl_state={"equity": settings.env.starting_equity, "pnl_today": 0.0, "pnl_mtd": 0.0, "progress": settings.env.starting_equity / 500 * 100, "drawdown": 0.0},
     )
     ctx.scheduler = Scheduler(ctx)
+    log.info(
+        "startup complete configured_markets=%d max_open_markets=%d starting_equity=%.2f",
+        len(settings.markets.markets),
+        settings.risk.max_open_markets,
+        settings.env.starting_equity,
+    )
     return ctx

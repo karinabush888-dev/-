@@ -15,6 +15,8 @@ class ExecutionManager:
         self.order_tags: dict[str, str] = {}
 
     async def place_limit(self, market_id: str, outcome_id: str, side: Side, price: float, size: float, *, tag: str = "generic"):
+        if size <= 0:
+            raise ValueError("order size must be > 0")
         req = OrderRequest(
             market_id=market_id,
             outcome_id=outcome_id,
@@ -47,6 +49,16 @@ class ExecutionManager:
         await self.repo.bulk_update_order_status(canceled_ids, OrderStatus.CANCELED.value, str(utc_now()))
         await self.notifier.send(f"cancel all orders requested={len(open_orders)} canceled={len(canceled_ids)}")
         return len(canceled_ids)
+
+    async def reconcile_open_orders(self) -> None:
+        exchange_open = await self.exchange.fetch_open_orders()
+        exchange_open_ids = {o.order_id for o in exchange_open}
+        db_open = await self.repo.get_open_orders()
+        now = str(utc_now())
+        for o in db_open:
+            if o.order_id not in exchange_open_ids:
+                await self.repo.upsert_order_status(o.order_id, OrderStatus.CANCELED.value, now)
+                self.order_tags.pop(o.order_id, None)
 
     async def cancel_market_orders(self, market_id: str, outcome_id: str | None = None, *, reason: str = "", tag_filter: set[str] | None = None) -> int:
         open_orders = await self.repo.get_open_orders(market_id=market_id, outcome_id=outcome_id)

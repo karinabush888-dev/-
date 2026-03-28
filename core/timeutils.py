@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 def utc_now() -> datetime:
-    return datetime.now(tz=UTC)
+    return datetime.now(tz=timezone.utc)
 
 
 def utc_day_key(dt: datetime | None = None) -> str:
@@ -14,5 +14,5 @@ def utc_day_key(dt: datetime | None = None) -> str:
 
 def seconds_until_next_utc_day(now: datetime | None = None) -> int:
     n = now or utc_now()
-    nxt = datetime(year=n.year, month=n.month, day=n.day, tzinfo=UTC) + timedelta(days=1)
+    nxt = datetime(year=n.year, month=n.month, day=n.day, tzinfo=timezone.utc) + timedelta(days=1)
     return int((nxt - n).total_seconds())
