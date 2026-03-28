@@ -117,7 +117,17 @@ class Scheduler:
             self.ctx.mis.on_tick(market_id, outcome_id, book.mid)
             stale_exit_order_id = self.ctx.mis.get_stale_pending_exit_order_id(market_id, outcome_id)
             if stale_exit_order_id:
-                canceled = await self.ctx.exec.cancel(stale_exit_order_id, reason="mispricing_exit_stale_retry")
+                try:
+                    canceled = await self.ctx.exec.cancel(stale_exit_order_id, reason="mispricing_exit_stale_retry")
+                except Exception as exc:
+                    canceled = False
+                    log.warning(
+                        "mispricing stale exit cancel errored market=%s outcome=%s order_id=%s error=%s",
+                        market_id,
+                        outcome_id,
+                        stale_exit_order_id,
+                        exc,
+                    )
                 if canceled:
                     self.ctx.mis.clear_pending_exit_order(market_id, outcome_id, stale_exit_order_id)
                     log.info("mispricing stale exit canceled market=%s outcome=%s order_id=%s", market_id, outcome_id, stale_exit_order_id)
