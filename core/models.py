@@ -102,7 +102,12 @@ class MispricingTrade:
     entry_price: float
     entry_ts: datetime
     size: float
+    remaining_size: float
     tp1_hit: bool = False
+    tp2_hit: bool = False
+    stop_hit: bool = False
+    time_stop_hit: bool = False
+    time_stop_deadline: datetime | None = None
     closed: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
 

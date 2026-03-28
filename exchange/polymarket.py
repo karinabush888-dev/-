@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,26 +18,67 @@ class LivePolymarketClient(ExchangeClient):
         api_key: str,
         api_secret: str,
         passphrase: str,
+        private_key: str,
+        proxy_address: str,
+        funder: str,
         timeout_sec: int = 15,
+        max_retries: int = 5,
+        retry_backoff_min: float = 0.5,
+        retry_backoff_max: float = 8.0,
     ) -> None:
+        missing = [k for k, v in {
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "passphrase": passphrase,
+            "private_key": private_key,
+            "proxy_address": proxy_address,
+            "funder": funder,
+        }.items() if not v]
+        if missing:
+            raise ValueError(f"LIVE Polymarket client missing credentials/signing fields: {', '.join(missing)}")
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
+        self.private_key = private_key
+        self.proxy_address = proxy_address
+        self.funder = funder
+        self.max_retries = max_retries
+        self.retry_backoff_min = retry_backoff_min
+        self.retry_backoff_max = retry_backoff_max
         self.client = httpx.AsyncClient(timeout=timeout_sec)
 
     async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         headers = {
             "X-API-KEY": self.api_key,
+            "X-API-SECRET": self.api_secret,
             "X-API-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
         }
-        r = await self.client.request(method, f"{self.api_base}{path}", json=payload, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict):
-            return data
-        return {"data": data}
+        url = f"{self.api_base}{path}"
+        retry = 0
+        backoff = self.retry_backoff_min
+        while True:
+            try:
+                r = await self.client.request(method, url, json=payload, headers=headers)
+                if r.status_code == 429 or r.status_code >= 500:
+                    raise httpx.HTTPStatusError("retryable upstream error", request=r.request, response=r)
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, dict):
+                    return data
+                return {"data": data}
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, ValueError) as exc:
+                retry += 1
+                status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) and exc.response else None
+                retryable = status_code in {429, 500, 502, 503, 504} or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+                if (not retryable) or retry >= self.max_retries:
+                    raise RuntimeError(f"Polymarket request failed method={method} path={path} retries={retry}: {exc}") from exc
+                retry_after = 0.0
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                    retry_after = float(exc.response.headers.get("retry-after", "0") or 0)
+                await asyncio.sleep(max(retry_after, backoff))
+                backoff = min(backoff * 2, self.retry_backoff_max)
 
     async def fetch_markets(self) -> list[Market]:
         data = await self._request("GET", "/markets")

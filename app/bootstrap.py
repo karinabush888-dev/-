@@ -59,8 +59,15 @@ async def build_context() -> AppContext:
             api_key=settings.env.polymarket_api_key,
             api_secret=settings.env.polymarket_api_secret,
             passphrase=settings.env.polymarket_passphrase,
+            private_key=settings.env.polymarket_private_key,
+            proxy_address=settings.env.polymarket_proxy_address,
+            funder=settings.env.polymarket_funder,
             timeout_sec=settings.env.http_timeout_sec,
+            max_retries=settings.env.max_retries,
+            retry_backoff_min=settings.env.retry_backoff_min,
+            retry_backoff_max=settings.env.retry_backoff_max,
         )
+        await exchange.get_server_time()
 
     repo = Repository(settings.env.db_path)
     notifier = TelegramNotifier(settings.env.telegram_enabled, settings.env.telegram_bot_token, settings.env.telegram_chat_id)

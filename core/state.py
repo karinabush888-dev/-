@@ -15,6 +15,7 @@ class RuntimeState:
     pause_until: datetime | None = None
     kill_switch_active: bool = False
     mispricing_trades: dict[tuple[str, str], MispricingTrade] = field(default_factory=dict)
+    blocked_markets: dict[str, str] = field(default_factory=dict)
     stats: BotStats = field(default_factory=lambda: BotStats(day_key=utc_day_key()))
 
     def reset_daily(self) -> None:
