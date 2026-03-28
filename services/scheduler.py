@@ -19,6 +19,9 @@ class Scheduler:
         self.last_fill_poll = None
         self.last_hour = None
         self.processed_fill_ids: set[str] = set()
+        self.last_position_snapshot_sig: dict[tuple[str, str], tuple[float, float, float, float, float]] = {}
+        self._last_mis_mm_pause_log_ts: dict[tuple[str, str], datetime] = {}
+        self._last_pause_log_ts: datetime | None = None
 
     async def run(self) -> None:
         await self._load_mode_state()
@@ -112,8 +115,12 @@ class Scheduler:
         if self.ctx.state.stats.day_key != utc_day_key(now):
             await self._on_new_day()
         if self.ctx.state.is_paused():
-            log.info("risk pause active until=%s", self.ctx.state.pause_until.isoformat() if self.ctx.state.pause_until else "unknown")
+            if self._last_pause_log_ts is None or (now - self._last_pause_log_ts).total_seconds() >= 300:
+                until = self.ctx.state.pause_until.isoformat() if self.ctx.state.pause_until else "unknown"
+                log.info("risk pause active until=%s kill_switch_active=%s", until, self.ctx.state.kill_switch_active)
+                self._last_pause_log_ts = now
             return
+        self._last_pause_log_ts = None
 
         mids: dict[tuple[str, str], float] = {}
         positions = await self.ctx.exchange.fetch_positions()
@@ -128,10 +135,16 @@ class Scheduler:
                 if self.ctx.state.blocked_markets.get(market_id) != reason:
                     self.ctx.state.blocked_markets[market_id] = reason
                     await self.ctx.exec.cancel_market_orders(market_id, outcome_id, reason=reason)
-                    await self.ctx.notifier.send(f"market {market_id} blocked: {reason}")
+                    await self.ctx.notifier.send(
+                        f"market {market_id} blocked: {reason}",
+                        dedupe_key=f"near_resolution_block:{market_id}:{reason}",
+                        dedupe_ttl_sec=3600,
+                    )
                     log.warning("near-resolution block market=%s outcome=%s resolution=%s", market_id, outcome_id, res.isoformat() if res else "unknown")
                 continue
-            self.ctx.state.blocked_markets.pop(market_id, None)
+            if market_id in self.ctx.state.blocked_markets:
+                old_reason = self.ctx.state.blocked_markets.pop(market_id)
+                log.info("market unblocked market=%s reason=%s", market_id, old_reason)
 
             book = await self.ctx.exchange.fetch_orderbook(market_id, outcome_id)
             mids[(market_id, outcome_id)] = book.mid
@@ -145,7 +158,11 @@ class Scheduler:
                 px = book.best_bid if action.side == Side.SELL else book.best_ask
                 exit_order = await self.ctx.exec.place_limit(market_id, outcome_id, action.side, px, action.size, tag="mis_exit")
                 self.ctx.mis.register_exit_order(exit_order.order_id, market_id, outcome_id, action.side, action.reason, action.size)
-                await self.ctx.notifier.send(f"mispricing exit trigger={action.reason} market={market_id} outcome={outcome_id} size={action.size}")
+                await self.ctx.notifier.send(
+                    f"mispricing exit trigger={action.reason} market={market_id} outcome={outcome_id} size={action.size}",
+                    dedupe_key=f"mis_exit_trigger:{market_id}:{outcome_id}:{action.reason}",
+                    dedupe_ttl_sec=max(30, self.ctx.settings.env.refresh_sec * 4),
+                )
                 log.info("mispricing exit triggered market=%s outcome=%s reason=%s size=%.4f", market_id, outcome_id, action.reason, action.size)
 
             has_mis_context = (
@@ -158,8 +175,21 @@ class Scheduler:
             if not is_blocked:
                 if has_mis_context:
                     await self.ctx.exec.cancel_market_orders(market_id, outcome_id, reason="mispricing_active", tag_filter={"mm_quote"})
-                    log.info("MM paused due to active/pending mispricing trade market=%s outcome=%s", market_id, outcome_id)
+                    last = self._last_mis_mm_pause_log_ts.get((market_id, outcome_id))
+                    if last is None or (now - last).total_seconds() >= 120:
+                        log.info(
+                            "MM paused for safety due to active/pending mispricing context market=%s outcome=%s rule=no_inventory_building_on_same_outcome",
+                            market_id,
+                            outcome_id,
+                        )
+                        await self.ctx.notifier.send(
+                            f"MM paused for market={market_id} outcome={outcome_id}: active mispricing context; contradictory inventory quotes suppressed",
+                            dedupe_key=f"mm_pause:{market_id}:{outcome_id}",
+                            dedupe_ttl_sec=300,
+                        )
+                        self._last_mis_mm_pause_log_ts[(market_id, outcome_id)] = now
                 else:
+                    self._last_mis_mm_pause_log_ts.pop((market_id, outcome_id), None)
                     (bside, bid), (sside, ask), reduce_only = self.ctx.mm.build_quotes(book, exp, sizing.max_exposure_per_outcome)
                     for o in open_orders:
                         if o.market_id == market_id and o.outcome_id == outcome_id and self.ctx.exec.order_tags.get(o.order_id) == "mm_quote":
@@ -183,16 +213,20 @@ class Scheduler:
                         self.ctx.mis.register_entry_order(entry_order.order_id, market_id, outcome_id, sig)
                         log.info("mispricing signal accepted market=%s outcome=%s side=%s price=%.4f size=%.4f", market_id, outcome_id, sig.value, px, sizing.order_size_mis)
 
+        fills_seen = 0
         fills = await self.ctx.exchange.fetch_fills(self.last_fill_poll)
         self.last_fill_poll = now
         for f in fills:
             if f.fill_id in self.processed_fill_ids:
                 continue
+            fills_seen += 1
             self.processed_fill_ids.add(f.fill_id)
             await self.ctx.repo.insert_fill(f)
             order_state = await self.ctx.repo.apply_fill_to_order(f.order_id, f.size, str(f.ts))
             if order_state:
                 log.info("order fill reconciled order_id=%s filled=%.4f/%.4f status=%s", f.order_id, order_state[1], order_state[0], order_state[2])
+            else:
+                log.warning("fill received for unknown order_id=%s fill_id=%s", f.order_id, f.fill_id)
             self.ctx.state.stats.trades_today += 1
             mis_state = self.ctx.mis.apply_fill(f)
             if mis_state:
@@ -201,17 +235,29 @@ class Scheduler:
                     await self.ctx.notifier.send(
                         f"mispricing trade opened market={f.market_id} outcome={f.outcome_id} side={f.side.value} entry={float(mis_state.get('entry_price', 0.0)):.4f}"
                     )
+                exit_event = str(mis_state.get("exit_event") or "")
+                if exit_event:
+                    await self.ctx.notifier.send(
+                        f"mispricing exit filled market={f.market_id} outcome={f.outcome_id} reason={exit_event} remaining={float(mis_state.get('remaining_size', 0.0)):.4f}",
+                        dedupe_key=f"mis_exit_fill:{f.market_id}:{f.outcome_id}:{exit_event}",
+                        dedupe_ttl_sec=300,
+                    )
                 if bool(mis_state.get("closed")):
                     close_reason = "stop" if bool(mis_state.get("stop_hit")) else "time_stop" if bool(mis_state.get("time_stop_hit")) else "tp"
                     await self.ctx.notifier.send(f"mispricing trade closed market={f.market_id} outcome={f.outcome_id} reason={close_reason}")
                     log.info("mispricing trade closed market=%s outcome=%s reason=%s", f.market_id, f.outcome_id, close_reason)
-                if bool(mis_state.get("stop_hit")):
+                if bool(mis_state.get("stopout_increment")):
                     self.ctx.state.stats.stopouts_today += 1
                     log.warning("mispricing stopout market=%s outcome=%s", f.market_id, f.outcome_id)
             p = self.ctx.state.positions.get((f.market_id, f.outcome_id))
             if p:
                 log.info("position update market=%s outcome=%s qty=%.4f avg=%.4f rpnl=%.4f upnl=%.4f", p.market_id, p.outcome_id, p.qty, p.avg_price, p.realized_pnl, p.unrealized_pnl)
             await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
+
+        if fills_seen > 0:
+            fresh_positions = await self.ctx.exchange.fetch_positions()
+            self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in fresh_positions}
+            log.info("positions refreshed after fill batch count=%d", len(self.ctx.state.positions))
 
         cash = await self.ctx.exchange.fetch_balance()
         equity, drawdown = self.ctx.pnl_engine.mark_to_market(cash, list(self.ctx.state.positions.values()), mids)
@@ -224,12 +270,16 @@ class Scheduler:
         if self.ctx.risk_engine.should_kill_switch(pnl_today, equity, self.ctx.state):
             self.ctx.risk_engine.activate_pause_to_next_day(self.ctx.state)
             await self.ctx.exec.cancel_all()
-            await self.ctx.notifier.send("kill switch activated; pause until next UTC day")
-            log.warning("kill switch activated pnl_today=%.4f equity=%.4f", pnl_today, equity)
+            pause_until = self.ctx.state.pause_until.isoformat() if self.ctx.state.pause_until else "unknown"
+            await self.ctx.notifier.send(
+                f"kill switch activated; pause until next UTC day ({pause_until})",
+                dedupe_key=f"kill_switch:{self.ctx.state.stats.day_key}",
+                dedupe_ttl_sec=3600,
+            )
+            log.warning("kill switch activated pnl_today=%.4f equity=%.4f pause_until=%s", pnl_today, equity, pause_until)
 
         await self.ctx.repo.snapshot_pnl(str(now), equity, pnl_today, pnl_mtd, progress, self.ctx.state.stats.mode.value, drawdown)
-        for p in self.ctx.state.positions.values():
-            await self.ctx.repo.snapshot_position(str(now), p, exposure_of(p))
+        await self._snapshot_positions(now)
         await self._persist_mispricing_state()
 
         if self.last_hour != now.hour:
@@ -278,9 +328,36 @@ class Scheduler:
         self.ctx.state.reset_daily()
         self.ctx.state.stats.mode = mode
         log.info("mode transition old=%s new=%s", old_mode.value, mode.value)
+        if old_mode != mode:
+            await self.ctx.notifier.send(
+                f"adaptation mode changed {old_mode.value} -> {mode.value}",
+                dedupe_key=f"mode_change:{old_day}:{old_mode.value}:{mode.value}",
+                dedupe_ttl_sec=86400,
+            )
         await self._persist_mode_state(mode, self.ctx.settings.risk.adaptation_window_hours)
         self.ctx.pnl_engine.reset_day(prev_equity)
         await self.ctx.notifier.send(f"new UTC day, mode={mode.value}, next reset in {seconds_until_next_utc_day()} sec")
+
+    async def _snapshot_positions(self, ts: datetime) -> None:
+        for p in self.ctx.state.positions.values():
+            sig = (
+                round(float(p.qty), 8),
+                round(float(p.avg_price), 8),
+                round(float(exposure_of(p)), 8),
+                round(float(p.realized_pnl), 8),
+                round(float(p.unrealized_pnl), 8),
+            )
+            prev_sig = self.last_position_snapshot_sig.get((p.market_id, p.outcome_id))
+            if prev_sig and prev_sig != sig:
+                log.warning(
+                    "position snapshot drift detected market=%s outcome=%s prev=%s now=%s",
+                    p.market_id,
+                    p.outcome_id,
+                    prev_sig,
+                    sig,
+                )
+            await self.ctx.repo.snapshot_position(str(ts), p, exposure_of(p))
+            self.last_position_snapshot_sig[(p.market_id, p.outcome_id)] = sig
 
     async def shutdown(self):
         self.running = False
