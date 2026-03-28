@@ -71,6 +71,7 @@ class Scheduler:
         prob_min = self.ctx.settings.markets.selection["prob_min"]
         prob_max = self.ctx.settings.markets.selection["prob_max"]
 
+        log.info("market resolution: configured=%d exchange_available=%d", len(configured), len(available))
         for cfg in configured:
             target_url = cfg["event_url"]
             market = available.get(self._normalize_event_url(target_url))
@@ -79,7 +80,9 @@ class Scheduler:
             out = self.ctx.selector(market, prob_min, prob_max)
             self.ctx.state.selected_outcomes[market.market_id] = out.outcome_id
             await self.ctx.repo.save_selected_market(market.market_id, market.name, out.outcome_id, out.label, out.implied_prob, out.volume, str(utc_now()))
-            await self.ctx.notifier.send(f"selected outcome {market.name}: {out.label} p={out.implied_prob:.2f} liq={out.volume:.0f}")
+            reason = f"within prob_band=[{prob_min:.2f},{prob_max:.2f}] max_liquidity={out.volume:.0f}"
+            log.info("selected outcome market=%s outcome=%s(%s) prob=%.4f volume=%.1f reason=%s", market.market_id, out.outcome_id, out.label, out.implied_prob, out.volume, reason)
+            await self.ctx.notifier.send(f"selected outcome {market.name}: {out.label} p={out.implied_prob:.2f} liq={out.volume:.0f}; reason={reason}")
 
     async def _tick(self):
         now = utc_now()
@@ -99,8 +102,9 @@ class Scheduler:
                 reason = f"near_resolution({res.isoformat() if res else 'unknown'})"
                 if self.ctx.state.blocked_markets.get(market_id) != reason:
                     self.ctx.state.blocked_markets[market_id] = reason
-                    await self.ctx.exec.cancel_market_orders(market_id, outcome_id)
+                    await self.ctx.exec.cancel_market_orders(market_id, outcome_id, reason=reason)
                     await self.ctx.notifier.send(f"market {market_id} blocked: {reason}")
+                    log.warning("near-resolution block market=%s outcome=%s resolution=%s", market_id, outcome_id, res.isoformat() if res else "unknown")
                 continue
 
             book = await self.ctx.exchange.fetch_orderbook(market_id, outcome_id)
@@ -113,39 +117,63 @@ class Scheduler:
             self.ctx.mis.on_tick(market_id, outcome_id, book.mid)
             for action in self.ctx.mis.manage_trade(market_id, outcome_id, book.mid):
                 px = book.best_bid if action.side == Side.SELL else book.best_ask
-                await self.ctx.exec.place_limit(market_id, outcome_id, action.side, px, action.size)
-                await self.ctx.notifier.send(f"mispricing {action.reason} market={market_id} size={action.size}")
-                if action.reason == "stop":
-                    self.ctx.state.stats.stopouts_today += 1
+                exit_order = await self.ctx.exec.place_limit(market_id, outcome_id, action.side, px, action.size, tag="mis_exit")
+                self.ctx.mis.register_exit_order(exit_order.order_id, market_id, outcome_id, action.side, action.reason, action.size)
+                await self.ctx.notifier.send(f"mispricing exit trigger={action.reason} market={market_id} outcome={outcome_id} size={action.size}")
+                log.info("mispricing exit triggered market=%s outcome=%s reason=%s size=%.4f", market_id, outcome_id, action.reason, action.size)
+
+            has_mis_context = (
+                self.ctx.mis.has_active_trade(market_id, outcome_id)
+                or self.ctx.mis.has_pending_entry(market_id, outcome_id)
+                or self.ctx.mis.has_pending_exit(market_id, outcome_id)
+            )
 
             is_blocked = market_id in self.ctx.state.blocked_markets
             if not is_blocked:
-                (bside, bid), (sside, ask), reduce_only = self.ctx.mm.build_quotes(book, exp, sizing.max_exposure_per_outcome)
-                for o in open_orders:
-                    if o.market_id == market_id and o.outcome_id == outcome_id:
-                        await self.ctx.exec.cancel(o.order_id)
-                if not reduce_only and exp < sizing.max_exposure_per_outcome:
-                    await self.ctx.exec.place_limit(market_id, outcome_id, bside, bid, sizing.order_size_mm)
-                if (not reduce_only and exp < sizing.max_exposure_per_outcome) or (p and p.qty > 0):
-                    await self.ctx.exec.place_limit(market_id, outcome_id, sside, ask, sizing.order_size_mm)
+                if has_mis_context:
+                    await self.ctx.exec.cancel_market_orders(market_id, outcome_id, reason="mispricing_active", tag_filter={"mm_quote"})
+                    log.info("MM paused due to active/pending mispricing trade market=%s outcome=%s", market_id, outcome_id)
+                else:
+                    (bside, bid), (sside, ask), reduce_only = self.ctx.mm.build_quotes(book, exp, sizing.max_exposure_per_outcome)
+                    for o in open_orders:
+                        if o.market_id == market_id and o.outcome_id == outcome_id and self.ctx.exec.order_tags.get(o.order_id) == "mm_quote":
+                            await self.ctx.exec.cancel(o.order_id, reason="mm_refresh")
+                    if not reduce_only and exp < sizing.max_exposure_per_outcome:
+                        await self.ctx.exec.place_limit(market_id, outcome_id, bside, bid, sizing.order_size_mm, tag="mm_quote")
+                    if (not reduce_only and exp < sizing.max_exposure_per_outcome) or (p and p.qty > 0):
+                        await self.ctx.exec.place_limit(market_id, outcome_id, sside, ask, sizing.order_size_mm, tag="mm_quote")
 
                 sig = self.ctx.mis.detect_signal(market_id, outcome_id)
-                if (
-                    sig
-                    and not self.ctx.mis.has_active_trade(market_id, outcome_id)
-                    and self.ctx.state.stats.mispricing_trades_today < self.ctx.settings.risk.max_mispricing_trades_per_day
-                    and exp < sizing.max_exposure_per_outcome
-                ):
-                    px = book.best_ask if sig == Side.BUY else book.best_bid
-                    await self.ctx.exec.place_limit(market_id, outcome_id, sig, px, sizing.order_size_mis)
-                    self.ctx.mis.start_trade(market_id, outcome_id, sig, px, sizing.order_size_mis)
-                    self.ctx.state.stats.mispricing_trades_today += 1
+                if sig:
+                    if has_mis_context:
+                        log.info("mispricing signal rejected market=%s outcome=%s reason=existing_trade_or_orders", market_id, outcome_id)
+                    elif self.ctx.state.stats.mispricing_trades_today >= self.ctx.settings.risk.max_mispricing_trades_per_day:
+                        log.info("mispricing signal rejected market=%s outcome=%s reason=max_trades_reached", market_id, outcome_id)
+                    elif exp >= sizing.max_exposure_per_outcome:
+                        log.info("mispricing signal rejected market=%s outcome=%s reason=max_exposure reached=%.4f max=%.4f", market_id, outcome_id, exp, sizing.max_exposure_per_outcome)
+                    else:
+                        px = book.best_ask if sig == Side.BUY else book.best_bid
+                        entry_order = await self.ctx.exec.place_limit(market_id, outcome_id, sig, px, sizing.order_size_mis, tag="mis_entry")
+                        self.ctx.mis.register_entry_order(entry_order.order_id, market_id, outcome_id, sig)
+                        log.info("mispricing signal accepted market=%s outcome=%s side=%s price=%.4f size=%.4f", market_id, outcome_id, sig.value, px, sizing.order_size_mis)
 
         fills = await self.ctx.exchange.fetch_fills(self.last_fill_poll)
         self.last_fill_poll = now
         for f in fills:
             await self.ctx.repo.insert_fill(f)
             self.ctx.state.stats.trades_today += 1
+            mis_state = self.ctx.mis.apply_fill(f)
+            if mis_state:
+                if bool(mis_state.get("opened")):
+                    self.ctx.state.stats.mispricing_trades_today += 1
+                    await self.ctx.notifier.send(
+                        f"mispricing trade opened market={f.market_id} outcome={f.outcome_id} side={f.side.value} entry={float(mis_state.get('entry_price', 0.0)):.4f}"
+                    )
+                if bool(mis_state.get("closed")):
+                    close_reason = "stop" if bool(mis_state.get("stop_hit")) else "time_stop" if bool(mis_state.get("time_stop_hit")) else "tp"
+                    await self.ctx.notifier.send(f"mispricing trade closed market={f.market_id} outcome={f.outcome_id} reason={close_reason}")
+                if bool(mis_state.get("stop_hit")):
+                    self.ctx.state.stats.stopouts_today += 1
             await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
 
         cash = await self.ctx.exchange.fetch_balance()

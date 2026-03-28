@@ -17,7 +17,8 @@ async def _main() -> None:
         stop_event.set()
 
     for s in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(s, _stop)
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(s, _stop)
 
     task = asyncio.create_task(ctx.scheduler.run())
     await stop_event.wait()
@@ -27,5 +28,9 @@ async def _main() -> None:
         await task
 
 
-if __name__ == "__main__":
+def main() -> None:
     asyncio.run(_main())
+
+
+if __name__ == "__main__":
+    main()

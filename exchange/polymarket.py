@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,6 +10,8 @@ import httpx
 from core.models import Fill, Market, Order, OrderBook, OrderRequest, Outcome, Position
 from core.types import OrderStatus, Side
 from exchange.base import ExchangeClient
+
+log = logging.getLogger(__name__)
 
 
 class LivePolymarketClient(ExchangeClient):
@@ -48,6 +51,10 @@ class LivePolymarketClient(ExchangeClient):
         self.retry_backoff_max = retry_backoff_max
         self.client = httpx.AsyncClient(timeout=timeout_sec)
 
+        log.warning(
+            "LIVE mode is enabled. Endpoint compatibility is assumed for /markets,/book,/orders,/fills,/positions and MUST be validated in staging before real deployment."
+        )
+
     async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         headers = {
             "X-API-KEY": self.api_key,
@@ -61,23 +68,28 @@ class LivePolymarketClient(ExchangeClient):
         while True:
             try:
                 r = await self.client.request(method, url, json=payload, headers=headers)
-                if r.status_code == 429 or r.status_code >= 500:
+                if r.status_code in {408, 429} or r.status_code >= 500:
                     raise httpx.HTTPStatusError("retryable upstream error", request=r.request, response=r)
                 r.raise_for_status()
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError as exc:
+                    raise RuntimeError(f"Non-JSON response from Polymarket path={path}") from exc
                 if isinstance(data, dict):
                     return data
                 return {"data": data}
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, ValueError) as exc:
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, ValueError, RuntimeError) as exc:
                 retry += 1
                 status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) and exc.response else None
-                retryable = status_code in {429, 500, 502, 503, 504} or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+                retryable = status_code in {408, 429, 500, 502, 503, 504} or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
                 if (not retryable) or retry >= self.max_retries:
                     raise RuntimeError(f"Polymarket request failed method={method} path={path} retries={retry}: {exc}") from exc
                 retry_after = 0.0
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
                     retry_after = float(exc.response.headers.get("retry-after", "0") or 0)
-                await asyncio.sleep(max(retry_after, backoff))
+                wait_s = max(retry_after, backoff)
+                log.warning("live api retry method=%s path=%s attempt=%d wait=%.2fs status=%s", method, path, retry, wait_s, status_code)
+                await asyncio.sleep(wait_s)
                 backoff = min(backoff * 2, self.retry_backoff_max)
 
     async def fetch_markets(self) -> list[Market]:
@@ -123,6 +135,7 @@ class LivePolymarketClient(ExchangeClient):
         b = data.get("data", data)
         bids = b.get("bids", [])
         asks = b.get("asks", [])
+        # Note: assumes [price,size] tuple format; verify on staging before production use.
         best_bid = float(bids[0][0] if bids else 0.01)
         best_ask = float(asks[0][0] if asks else 0.99)
         bid_size = float(bids[0][1] if bids else 0)
@@ -178,7 +191,10 @@ class LivePolymarketClient(ExchangeClient):
         return True
 
     async def cancel_all_orders(self) -> int:
+        # Endpoint semantics vary across deployments; rely on per-order cancel upstream when strict consistency is required.
         data = await self._request("DELETE", "/orders")
+        if "canceled" not in data:
+            log.warning("cancel_all_orders response missing canceled count; treating as 0 and relying on follow-up reconciliation")
         return int(data.get("canceled", 0))
 
     async def fetch_open_orders(self) -> list[Order]:
@@ -257,4 +273,5 @@ class LivePolymarketClient(ExchangeClient):
                     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
+        log.warning("market resolution time unavailable for market_id=%s; near-resolution risk controls may be reduced", market_id)
         return None

@@ -12,8 +12,9 @@ class ExecutionManager:
         self.exchange = exchange
         self.repo = repo
         self.notifier = notifier
+        self.order_tags: dict[str, str] = {}
 
-    async def place_limit(self, market_id: str, outcome_id: str, side: Side, price: float, size: float):
+    async def place_limit(self, market_id: str, outcome_id: str, side: Side, price: float, size: float, *, tag: str = "generic"):
         req = OrderRequest(
             market_id=market_id,
             outcome_id=outcome_id,
@@ -24,33 +25,43 @@ class ExecutionManager:
         )
         o = await self.exchange.place_order(req)
         await self.repo.insert_order(o)
-        await self.notifier.send(f"order placed {o.order_id} {side.value} {size}@{price:.4f} {market_id}/{outcome_id}")
+        self.order_tags[o.order_id] = tag
+        await self.notifier.send(f"order placed {o.order_id} {side.value} {size}@{price:.4f} {market_id}/{outcome_id} tag={tag}")
         return o
 
-    async def cancel(self, order_id: str):
+    async def cancel(self, order_id: str, *, reason: str = ""):
         ok = await self.exchange.cancel_order(order_id)
         if ok:
             await self.repo.upsert_order_status(order_id, OrderStatus.CANCELED.value, str(utc_now()))
-            await self.notifier.send(f"order canceled {order_id}")
+            self.order_tags.pop(order_id, None)
+            await self.notifier.send(f"order canceled {order_id}{' reason=' + reason if reason else ''}")
         return ok
 
     async def cancel_all(self):
         open_orders = await self.repo.get_open_orders()
-        n = await self.exchange.cancel_all_orders()
-        await self.repo.bulk_update_order_status([o.order_id for o in open_orders], OrderStatus.CANCELED.value, str(utc_now()))
-        await self.notifier.send(f"cancel all orders: {n}")
-        return n
-
-    async def cancel_market_orders(self, market_id: str, outcome_id: str | None = None) -> int:
-        open_orders = await self.repo.get_open_orders(market_id=market_id, outcome_id=outcome_id)
-        canceled = 0
+        canceled_ids: list[str] = []
         for o in open_orders:
             if await self.exchange.cancel_order(o.order_id):
-                canceled += 1
-        await self.repo.bulk_update_order_status([o.order_id for o in open_orders], OrderStatus.CANCELED.value, str(utc_now()))
-        if canceled:
-            await self.notifier.send(f"canceled {canceled} orders for market={market_id} outcome={outcome_id or '*'}")
-        return canceled
+                canceled_ids.append(o.order_id)
+                self.order_tags.pop(o.order_id, None)
+        await self.repo.bulk_update_order_status(canceled_ids, OrderStatus.CANCELED.value, str(utc_now()))
+        await self.notifier.send(f"cancel all orders requested={len(open_orders)} canceled={len(canceled_ids)}")
+        return len(canceled_ids)
+
+    async def cancel_market_orders(self, market_id: str, outcome_id: str | None = None, *, reason: str = "", tag_filter: set[str] | None = None) -> int:
+        open_orders = await self.repo.get_open_orders(market_id=market_id, outcome_id=outcome_id)
+        if tag_filter is not None:
+            open_orders = [o for o in open_orders if self.order_tags.get(o.order_id) in tag_filter]
+        canceled_ids: list[str] = []
+        for o in open_orders:
+            if await self.exchange.cancel_order(o.order_id):
+                canceled_ids.append(o.order_id)
+                self.order_tags.pop(o.order_id, None)
+        await self.repo.bulk_update_order_status(canceled_ids, OrderStatus.CANCELED.value, str(utc_now()))
+        if canceled_ids:
+            suffix = f" reason={reason}" if reason else ""
+            await self.notifier.send(f"canceled {len(canceled_ids)} orders for market={market_id} outcome={outcome_id or '*'}{suffix}")
+        return len(canceled_ids)
 
     async def replace_limit(
         self,
@@ -60,6 +71,13 @@ class ExecutionManager:
         side: Side,
         price: float,
         size: float,
+        *,
+        old_tag: str | None = None,
+        new_tag: str | None = None,
     ):
-        await self.cancel(old_order_id)
-        return await self.place_limit(market_id, outcome_id, side, price, size)
+        canceled = await self.cancel(old_order_id, reason="replace")
+        if not canceled:
+            raise RuntimeError(f"replace failed; could not cancel old order {old_order_id}")
+        if old_tag:
+            self.order_tags.pop(old_order_id, None)
+        return await self.place_limit(market_id, outcome_id, side, price, size, tag=new_tag or old_tag or "replace")
