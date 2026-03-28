@@ -1,0 +1,14 @@
+services:
+  polymarket-bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: polymarket-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    command: ["python", "-m", "app.main"]
