@@ -33,11 +33,21 @@ class ExecutionManager:
 
     async def cancel(self, order_id: str, *, reason: str = ""):
         ok = await self.exchange.cancel_order(order_id)
+        now = str(utc_now())
         if ok:
-            await self.repo.upsert_order_status(order_id, OrderStatus.CANCELED.value, str(utc_now()))
+            await self.repo.upsert_order_status(order_id, OrderStatus.CANCELED.value, now)
             self.order_tags.pop(order_id, None)
             await self.notifier.send(f"order canceled {order_id}{' reason=' + reason if reason else ''}")
-        return ok
+            return True
+
+        # Fallback reconciliation: if not open upstream anymore, close stale DB row to avoid OPEN drift.
+        exchange_open_ids = {o.order_id for o in await self.exchange.fetch_open_orders()}
+        if order_id not in exchange_open_ids:
+            await self.repo.upsert_order_status(order_id, OrderStatus.CANCELED.value, now)
+            self.order_tags.pop(order_id, None)
+            await self.notifier.send(f"order cancel reconciled {order_id}{' reason=' + reason if reason else ''}")
+            return True
+        return False
 
     async def cancel_all(self):
         open_orders = await self.repo.get_open_orders()
@@ -47,6 +57,7 @@ class ExecutionManager:
                 canceled_ids.append(o.order_id)
                 self.order_tags.pop(o.order_id, None)
         await self.repo.bulk_update_order_status(canceled_ids, OrderStatus.CANCELED.value, str(utc_now()))
+        await self.reconcile_open_orders()
         await self.notifier.send(f"cancel all orders requested={len(open_orders)} canceled={len(canceled_ids)}")
         return len(canceled_ids)
 
@@ -70,6 +81,7 @@ class ExecutionManager:
                 canceled_ids.append(o.order_id)
                 self.order_tags.pop(o.order_id, None)
         await self.repo.bulk_update_order_status(canceled_ids, OrderStatus.CANCELED.value, str(utc_now()))
+        await self.reconcile_open_orders()
         if canceled_ids:
             suffix = f" reason={reason}" if reason else ""
             await self.notifier.send(f"canceled {len(canceled_ids)} orders for market={market_id} outcome={outcome_id or '*'}{suffix}")

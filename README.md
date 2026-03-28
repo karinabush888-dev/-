@@ -24,6 +24,7 @@ Copy `.env.example` to `.env` and set values.
 docker compose up -d --build
 ```
 Container command is `python -m app.main`.
+For a PAPER-first start, set `MODE=PAPER` in `.env` (or inline: `MODE=PAPER docker compose up -d --build`).
 
 ## Run locally
 > Use module mode (do **not** assume `python app/main.py`).
@@ -40,14 +41,15 @@ Startup fails fast when `config/markets.yaml` / `config/risk.yaml` are missing o
 ## PAPER Mode workflow (first)
 1. Start in PAPER mode.
 2. Verify startup log/notifier shows configured markets and selected outcomes.
-3. Check fills, order status transitions (`OPEN/PARTIAL/FILLED/CANCELED`), position snapshots, and PnL snapshots in SQLite.
+3. Check fills, order status transitions (`OPEN/PARTIAL/FILLED/CANCELED`), and position snapshot consistency in SQLite (`positions_snapshots` should track every cycle and post-fill state changes).
 4. Tune `config/risk.yaml` sizing and stop settings before any LIVE test.
 
 ## LIVE Mode (limited / requires validation)
 ```bash
 MODE=LIVE docker compose up -d --build
 ```
-LIVE credentials are fail-fast validated at startup. The live client currently uses assumed endpoint mappings (`/markets`, `/book`, `/orders`, `/fills`, `/positions`) and must be validated in staging/sandbox before real capital.
+LIVE credentials are fail-fast validated at startup. The live client currently uses assumed endpoint mappings (`/markets`, `/book`, `/orders`, `/fills`, `/positions`, `/time`) and must be validated in staging/sandbox before real capital.
+Startup emits explicit LIVE warnings because endpoint payload/status semantics are still assumption-based until externally validated.
 
 ## Data and Logs
 - SQLite DB: `./data/bot.sqlite3` (or `DB_PATH` if overridden)
@@ -57,11 +59,12 @@ LIVE credentials are fail-fast validated at startup. The live client currently u
 ## Strategy Behavior (current)
 - **Outcome selection:** one configured outcome per market, probability band filtered and liquidity-biased.
 - **Market-making:** periodic quote refresh, inventory skew/reduce-only controls, and outcome-level suppression when mispricing context is active.
-- **Mispricing lifecycle:** signal detection, entry tracking from real fills, TP1/TP2/stop/time-stop exits, single active trade per outcome, and restart recovery for active trades.
-- **Conflict guard:** MM quoting is paused on an outcome while mispricing trade/order context is active there.
-- **Risk controls:** kill switch on daily drawdown / stopout thresholds, pause until next UTC day.
-- **Position/PnL chain:** exchange fills reconcile positions; scheduler snapshots `positions_snapshots` and `pnl_snapshots` each cycle.
+- **Mispricing lifecycle:** signal detection, entry tracking from real fills, TP1/TP2/stop/time-stop exits with single-fire state tracking, single active trade per outcome, and restart recovery for only still-open trades.
+- **Conflict guard:** MM quoting is explicitly paused on an outcome while mispricing trade/order context is active there (rule: no contradictory inventory-building quotes on the same outcome).
+- **Risk controls:** kill switch on daily drawdown / stopout thresholds, explicit pause-until-next-UTC-day state/logging, and near-resolution market blocking with cancel/report hooks.
+- **Position/PnL chain:** exchange fills reconcile orders first, positions are refreshed after fill batches, and scheduler snapshots `positions_snapshots` + `pnl_snapshots` each cycle.
 - **Adaptation modes:** `NORMAL / ACCEL / BRAKE` are persisted with activation/expiry and restored on restart if still valid.
+- **Telegram reporting:** supports fill/order/report notifications with dedupe keys for key operational events (mispricing exits, kill switch, near-resolution blocks, adaptation mode transitions).
 
 ## Inspect DB
 ```bash
@@ -80,3 +83,4 @@ docker compose down
 - Reconciliation tests for partial fills, cancels, and cancel-all semantics against real venue behavior.
 - Dry-run/staging burn-in with alerting and manual supervision.
 - Confirmation of LIVE `/time`, `/markets`, `/book`, `/orders`, `/fills`, `/positions`, and market resolution timestamp field mapping in your target environment.
+- Validation that LIVE cancel/replace/fill semantics exactly match repository assumptions under real exchange edge-cases.

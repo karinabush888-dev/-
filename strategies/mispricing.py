@@ -173,7 +173,7 @@ class MispricingStrategy:
                 actions.append(MispricingExitAction(side=exit_side, size=size, reason="stop"))
             return actions
 
-        if trade.time_stop_deadline and now >= trade.time_stop_deadline and not trade.time_stop_hit:
+        if trade.time_stop_deadline and now >= trade.time_stop_deadline and not trade.time_stop_hit and not trade.stop_hit:
             size = round(trade.remaining_size, 4)
             if size > 0:
                 actions.append(MispricingExitAction(side=exit_side, size=size, reason="time_stop"))
@@ -232,6 +232,8 @@ class MispricingStrategy:
 
         exit_pending = self.pending_exit_orders.get(key)
         is_tracked_exit_fill = bool(exit_pending and exit_pending.get("order_id") == fill.order_id)
+        exit_event: str | None = None
+        stopout_increment = False
         if fill.side != trade.side and is_tracked_exit_fill:
             closed_size = round(min(fill.size, trade.remaining_size), 4)
             if closed_size > 0:
@@ -241,12 +243,21 @@ class MispricingStrategy:
                 if reason == "tp1":
                     trade.meta["tp1_filled"] = round(float(trade.meta.get("tp1_filled", 0.0)) + closed_size, 4)
                     if float(trade.meta["tp1_filled"]) >= round(trade.size * self.cfg.mis_tp1_close_pct, 4):
+                        if not trade.tp1_hit:
+                            exit_event = "tp1"
                         trade.tp1_hit = True
                 elif reason == "tp2":
+                    if not trade.tp2_hit:
+                        exit_event = "tp2"
                     trade.tp2_hit = True
                 elif reason == "stop":
+                    if not trade.stop_hit:
+                        stopout_increment = True
+                        exit_event = "stop"
                     trade.stop_hit = True
                 elif reason == "time_stop":
+                    if not trade.time_stop_hit:
+                        exit_event = "time_stop"
                     trade.time_stop_hit = True
 
                 if float(exit_pending["filled_size"]) + 1e-9 >= float(exit_pending["target_size"]):
@@ -262,6 +273,8 @@ class MispricingStrategy:
             "closed": trade.closed,
             "stop_hit": trade.stop_hit,
             "time_stop_hit": trade.time_stop_hit,
+            "exit_event": exit_event,
+            "stopout_increment": stopout_increment,
             "remaining_size": trade.remaining_size,
             "entry_price": trade.entry_price,
         }
