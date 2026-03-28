@@ -19,7 +19,11 @@ class Reporter:
             f"mode={payload['mode']}\n"
             f"positions={payload['positions']}"
         )
-        await self.notifier.send(txt)
+        await self.notifier.send(
+            txt,
+            dedupe_key=f"hourly_report:{str(payload.get('ts', ''))[:13]}",
+            dedupe_ttl_sec=3700,
+        )
 
     async def daily(self, payload: dict) -> None:
         txt = (
@@ -35,4 +39,8 @@ class Reporter:
             f"max_drawdown={payload['max_drawdown']:.4f}\n"
             f"mode_close={payload['mode']}"
         )
-        await self.notifier.send(txt)
+        await self.notifier.send(
+            txt,
+            dedupe_key=f"daily_summary:{payload.get('day_key', 'unknown')}",
+            dedupe_ttl_sec=90000,
+        )
