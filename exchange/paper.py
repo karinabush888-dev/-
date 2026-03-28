@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from core.models import Fill, Market, Order, OrderBook, OrderRequest, Outcome, Position
@@ -16,6 +16,7 @@ class PaperExchangeClient(ExchangeClient):
     def __init__(self, starting_equity: float, latency_ms: int = 250) -> None:
         self.cash = starting_equity
         self.latency_ms = latency_ms
+        self.market_resolution_times: dict[str, datetime] = {}
         self.markets = self._seed_markets()
         self.books: dict[tuple[str, str], OrderBook] = {}
         self.orders: dict[str, Order] = {}
@@ -25,17 +26,28 @@ class PaperExchangeClient(ExchangeClient):
 
     def _seed_markets(self) -> list[Market]:
         base = [
-            ("mkt_btc", "BTC", "https://polymarket.com/event/bitcoin-above-on-april-3"),
-            ("mkt_eth", "ETH", "https://polymarket.com/event/ethereum-above-on-april-4"),
+            (
+                "mkt_btc",
+                "Bitcoin Above on April 3",
+                "https://polymarket.com/event/bitcoin-above-on-april-3",
+                datetime(2026, 4, 3, 23, 59, tzinfo=timezone.utc),
+            ),
+            (
+                "mkt_eth",
+                "Ethereum Above on April 4",
+                "https://polymarket.com/event/ethereum-above-on-april-4",
+                datetime(2026, 4, 4, 23, 59, tzinfo=timezone.utc),
+            ),
         ]
         out: list[Market] = []
-        for mid, name, url in base:
+        for mid, name, url, resolution_time in base:
             outcomes = [
                 Outcome(f"{mid}_o1", "Strike 1", 0.35, 15000),
                 Outcome(f"{mid}_o2", "Strike 2", 0.50, 22000),
                 Outcome(f"{mid}_o3", "Strike 3", 0.67, 12000),
             ]
             out.append(Market(market_id=mid, name=name, event_url=url, outcomes=outcomes))
+            self.market_resolution_times[mid] = resolution_time
         return out
 
     def _build_books(self) -> None:
@@ -175,4 +187,4 @@ class PaperExchangeClient(ExchangeClient):
         return utc_now()
 
     async def get_market_resolution_time(self, market_id: str) -> datetime | None:
-        return utc_now().replace(hour=23, minute=59, second=0, microsecond=0)
+        return self.market_resolution_times.get(market_id)
