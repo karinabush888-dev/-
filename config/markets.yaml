@@ -1,0 +1,10 @@
+markets:
+  - name: BTC
+    event_url: https://polymarket.com/ru/event/bitcoin-above-on-march-17
+  - name: ETH
+    event_url: https://polymarket.com/ru/event/ethereum-above-on-march-17
+selection:
+  prob_min: 0.30
+  prob_max: 0.70
+  prefer_liquidity: true
+  tie_break_to_50: true
