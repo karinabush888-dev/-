@@ -30,7 +30,8 @@ CREATE_SQL = [
       price REAL,
       size REAL,
       fee REAL,
-      ts TEXT
+      ts TEXT,
+      reconciled INTEGER DEFAULT 0
     )
     """,
     """
@@ -95,4 +96,8 @@ async def init_db(path: str) -> None:
         cols = {row[1] for row in await cur.fetchall()}
         if "filled_size" not in cols:
             await db.execute("ALTER TABLE orders ADD COLUMN filled_size REAL DEFAULT 0")
+        cur = await db.execute("PRAGMA table_info(fills)")
+        fill_cols = {row[1] for row in await cur.fetchall()}
+        if "reconciled" not in fill_cols:
+            await db.execute("ALTER TABLE fills ADD COLUMN reconciled INTEGER DEFAULT 0")
         await db.commit()

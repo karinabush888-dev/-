@@ -253,20 +253,28 @@ class Scheduler:
             inserted = await self.ctx.repo.insert_fill(f)
             if inserted:
                 self.inserted_fill_ids_this_run.add(f.fill_id)
-            elif f.fill_id not in self.inserted_fill_ids_this_run:
-                log.info(
-                    "duplicate fill detected from persisted history; skipping replay fill_id=%s order_id=%s",
-                    f.fill_id,
-                    f.order_id,
-                )
-                self.processed_fill_ids.add(f.fill_id)
-                continue
             else:
-                log.info(
-                    "duplicate fill detected after partial processing; reconciling downstream state fill_id=%s order_id=%s",
-                    f.fill_id,
-                    f.order_id,
-                )
+                reconciled = await self.ctx.repo.is_fill_reconciled(f.fill_id)
+                if reconciled:
+                    log.info(
+                        "duplicate fill already reconciled; skipping replay fill_id=%s order_id=%s",
+                        f.fill_id,
+                        f.order_id,
+                    )
+                    self.processed_fill_ids.add(f.fill_id)
+                    continue
+                if f.fill_id in self.inserted_fill_ids_this_run:
+                    log.info(
+                        "duplicate fill detected after partial same-run processing; reconciling downstream state fill_id=%s order_id=%s",
+                        f.fill_id,
+                        f.order_id,
+                    )
+                else:
+                    log.warning(
+                        "found unreconciled persisted fill after restart; resuming reconciliation fill_id=%s order_id=%s",
+                        f.fill_id,
+                        f.order_id,
+                    )
             fills_seen += 1
             order_state = await self.ctx.repo.apply_fill_to_order(f.order_id, f.size, str(f.ts))
             if order_state:
@@ -308,6 +316,7 @@ class Scheduler:
                 if bool(mis_state.get("stopout_increment")):
                     self.ctx.state.stats.stopouts_today += 1
                     log.warning("mispricing stopout market=%s outcome=%s stopouts_today=%d", f.market_id, f.outcome_id, self.ctx.state.stats.stopouts_today)
+            await self.ctx.repo.mark_fill_reconciled(f.fill_id)
             self.processed_fill_ids.add(f.fill_id)
             notifications.append((f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}", None, None))
             for message, dedupe_key, dedupe_ttl_sec in notifications:

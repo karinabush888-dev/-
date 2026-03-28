@@ -86,11 +86,22 @@ class Repository:
     async def insert_fill(self, f: Fill) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
-                "INSERT OR IGNORE INTO fills VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO fills (fill_id, order_id, market_id, outcome_id, side, price, size, fee, ts, reconciled) VALUES (?,?,?,?,?,?,?,?,?,0)",
                 (f.fill_id, f.order_id, f.market_id, f.outcome_id, f.side.value, f.price, f.size, f.fee, str(f.ts)),
             )
             await db.commit()
             return (cur.rowcount or 0) > 0
+
+    async def is_fill_reconciled(self, fill_id: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT reconciled FROM fills WHERE fill_id=?", (fill_id,))
+            row = await cur.fetchone()
+            return bool(row and int(row[0] or 0) == 1)
+
+    async def mark_fill_reconciled(self, fill_id: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE fills SET reconciled=1 WHERE fill_id=?", (fill_id,))
+            await db.commit()
 
     async def snapshot_position(self, ts: str, p: Position, exposure: float) -> None:
         async with aiosqlite.connect(self.db_path) as db:
