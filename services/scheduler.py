@@ -94,6 +94,7 @@ class Scheduler:
         self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in positions}
         open_orders = await self.ctx.exchange.fetch_open_orders()
         open_order_ids = {o.order_id for o in open_orders}
+        newly_placed_entry_order_ids: set[str] = set()
 
         for market_id, outcome_id in self.ctx.state.selected_outcomes.items():
             res = await self.ctx.exchange.get_market_resolution_time(market_id)
@@ -140,6 +141,7 @@ class Scheduler:
                 ):
                     px = book.best_ask if sig == Side.BUY else book.best_bid
                     entry_order = await self.ctx.exec.place_limit(market_id, outcome_id, sig, px, sizing.order_size_mis)
+                    newly_placed_entry_order_ids.add(entry_order.order_id)
                     self.pending_mispricing_entries[entry_order.order_id] = {
                         "market_id": market_id,
                         "outcome_id": outcome_id,
@@ -164,7 +166,8 @@ class Scheduler:
                         f"mispricing entry filled market={market_id} outcome={outcome_id} size={f.size}"
                     )
             await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
-        stale_pending = [oid for oid in self.pending_mispricing_entries if oid not in open_order_ids]
+        active_entry_order_ids = open_order_ids | newly_placed_entry_order_ids
+        stale_pending = [oid for oid in self.pending_mispricing_entries if oid not in active_entry_order_ids]
         for oid in stale_pending:
             self.pending_mispricing_entries.pop(oid, None)
 
