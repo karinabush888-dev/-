@@ -13,7 +13,11 @@ class Repository:
     async def insert_order(self, o: Order) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO orders VALUES (?,?,?,?,?,?,?,?,?,?)",
+                """
+                INSERT OR REPLACE INTO orders
+                (order_id, market_id, outcome_id, side, price, size, filled_size, status, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
                 (o.order_id, o.market_id, o.outcome_id, o.side.value, o.price, o.size, o.filled_size, o.status.value, str(o.created_at), str(o.updated_at)),
             )
             await db.commit()
