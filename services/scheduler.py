@@ -153,8 +153,7 @@ class Scheduler:
         self._last_pause_log_ts = None
 
         mids: dict[tuple[str, str], float] = {}
-        positions = await self.ctx.exchange.fetch_positions()
-        self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in positions}
+        await self._refresh_positions(reason="tick_start")
         self._prune_stale_mispricing_trades()
         await self.ctx.exec.reconcile_open_orders()
         open_orders = await self.ctx.exchange.fetch_open_orders()
@@ -250,9 +249,13 @@ class Scheduler:
         for f in fills:
             if f.fill_id in self.processed_fill_ids:
                 continue
+            inserted = await self.ctx.repo.insert_fill(f)
+            if not inserted:
+                log.info("duplicate fill ignored fill_id=%s order_id=%s", f.fill_id, f.order_id)
+                self.processed_fill_ids.add(f.fill_id)
+                continue
             fills_seen += 1
             self.processed_fill_ids.add(f.fill_id)
-            await self.ctx.repo.insert_fill(f)
             order_state = await self.ctx.repo.apply_fill_to_order(f.order_id, f.size, str(f.ts))
             if order_state:
                 log.info("order fill reconciled order_id=%s filled=%.4f/%.4f status=%s", f.order_id, order_state[1], order_state[0], order_state[2])
@@ -286,15 +289,10 @@ class Scheduler:
                 if bool(mis_state.get("stopout_increment")):
                     self.ctx.state.stats.stopouts_today += 1
                     log.warning("mispricing stopout market=%s outcome=%s stopouts_today=%d", f.market_id, f.outcome_id, self.ctx.state.stats.stopouts_today)
-            p = self.ctx.state.positions.get((f.market_id, f.outcome_id))
-            if p:
-                log.info("position update market=%s outcome=%s qty=%.4f avg=%.4f rpnl=%.4f upnl=%.4f", p.market_id, p.outcome_id, p.qty, p.avg_price, p.realized_pnl, p.unrealized_pnl)
             await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
 
         if fills_seen > 0:
-            fresh_positions = await self.ctx.exchange.fetch_positions()
-            self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in fresh_positions}
-            log.info("positions refreshed after fill batch count=%d", len(self.ctx.state.positions))
+            await self._refresh_positions(reason="post_fill")
 
         cash = await self.ctx.exchange.fetch_balance()
         equity, drawdown = self.ctx.pnl_engine.mark_to_market(cash, list(self.ctx.state.positions.values()), mids)
@@ -302,7 +300,15 @@ class Scheduler:
         pnl_mtd = self.ctx.pnl_engine.pnl_mtd(equity)
         progress = self.ctx.pnl_engine.progress_to_goal_500(equity)
         self.ctx.pnl_state = {"equity": equity, "pnl_today": pnl_today, "pnl_mtd": pnl_mtd, "progress": progress, "drawdown": drawdown}
-        log.info("pnl update equity=%.4f pnl_today=%.4f pnl_mtd=%.4f drawdown=%.4f", equity, pnl_today, pnl_mtd, drawdown)
+        log.info(
+            "pnl update cash=%.4f equity=%.4f pnl_today=%.4f pnl_mtd=%.4f drawdown=%.4f positions=%d",
+            cash,
+            equity,
+            pnl_today,
+            pnl_mtd,
+            drawdown,
+            len(self.ctx.state.positions),
+        )
 
         kill_reason = self.ctx.risk_engine.kill_switch_reason(pnl_today, equity, self.ctx.state)
         if kill_reason:
@@ -322,6 +328,14 @@ class Scheduler:
             log.warning("kill switch activated reason=%s pnl_today=%.4f equity=%.4f pause_until=%s", kill_reason, pnl_today, equity, pause_until)
 
         await self.ctx.repo.snapshot_pnl(str(now), equity, pnl_today, pnl_mtd, progress, self.ctx.state.stats.mode.value, drawdown)
+        log.info(
+            "pnl snapshot written ts=%s equity=%.4f pnl_today=%.4f pnl_mtd=%.4f drawdown=%.4f",
+            now.isoformat(),
+            equity,
+            pnl_today,
+            pnl_mtd,
+            drawdown,
+        )
         await self._snapshot_positions(now)
         await self._persist_mispricing_state()
 
@@ -397,16 +411,60 @@ class Scheduler:
                 round(float(p.unrealized_pnl), 8),
             )
             prev_sig = self.last_position_snapshot_sig.get((p.market_id, p.outcome_id))
-            if prev_sig and prev_sig != sig:
+            drift_vals: list[str] = []
+            if sig[2] != round(abs(sig[0] * sig[1]), 8):
+                drift_vals.append("exposure")
+            if prev_sig and self._has_unexpected_position_drift(sig):
                 log.warning(
-                    "position snapshot drift detected market=%s outcome=%s prev=%s now=%s",
+                    "position snapshot drift detected market=%s outcome=%s prev=%s now=%s fields=%s",
                     p.market_id,
                     p.outcome_id,
                     prev_sig,
                     sig,
+                    ",".join(drift_vals) if drift_vals else "unknown",
                 )
             await self.ctx.repo.snapshot_position(str(ts), p, exposure_of(p))
+            log.info(
+                "position snapshot written ts=%s market=%s outcome=%s qty=%.4f avg=%.4f exp=%.4f rpnl=%.4f upnl=%.4f",
+                ts.isoformat(),
+                p.market_id,
+                p.outcome_id,
+                p.qty,
+                p.avg_price,
+                exposure_of(p),
+                p.realized_pnl,
+                p.unrealized_pnl,
+            )
             self.last_position_snapshot_sig[(p.market_id, p.outcome_id)] = sig
+
+    async def _refresh_positions(self, *, reason: str) -> None:
+        fresh_positions = await self.ctx.exchange.fetch_positions()
+        self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in fresh_positions}
+        log.info("positions refreshed reason=%s count=%d", reason, len(self.ctx.state.positions))
+        for p in fresh_positions:
+            log.info(
+                "position reconciled market=%s outcome=%s qty=%.4f avg=%.4f rpnl=%.4f upnl=%.4f",
+                p.market_id,
+                p.outcome_id,
+                p.qty,
+                p.avg_price,
+                p.realized_pnl,
+                p.unrealized_pnl,
+            )
+
+    @staticmethod
+    def _has_unexpected_position_drift(sig: tuple[float, float, float, float, float]) -> bool:
+        # Normal fills should change qty/avg/rpnl/upnl over time; only flag impossible states.
+        qty, avg, exp, _, _ = sig
+        if abs(qty) <= 1e-8 and (abs(avg) > 1e-8 or abs(exp) > 1e-8):
+            return True
+        if abs(exp - abs(qty * avg)) > 1e-6:
+            return True
+        # Detect NaN/inf-like numeric instability using self-inequality and huge bounds.
+        for v in sig:
+            if v != v or abs(v) > 1e12:
+                return True
+        return False
 
     async def shutdown(self):
         self.running = False
