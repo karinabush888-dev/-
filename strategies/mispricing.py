@@ -69,6 +69,18 @@ class MispricingStrategy:
         self.active_trades[key] = trade
         return trade
 
+    def record_entry_fill(self, market_id: str, outcome_id: str, side: Side, fill_price: float, fill_size: float) -> MispricingTrade:
+        key = (market_id, outcome_id)
+        trade = self.active_trades.get(key)
+        if trade and not trade.closed and trade.side == side:
+            total_size = trade.size + fill_size
+            if total_size > 0:
+                trade.entry_price = ((trade.entry_price * trade.size) + (fill_price * fill_size)) / total_size
+            trade.size = round(total_size, 4)
+            trade.remaining_size = round(trade.remaining_size + fill_size, 4)
+            return trade
+        return self.start_trade(market_id, outcome_id, side, fill_price, fill_size)
+
     def has_active_trade(self, market_id: str, outcome_id: str) -> bool:
         trade = self.active_trades.get((market_id, outcome_id))
         return bool(trade and not trade.closed)
