@@ -44,10 +44,12 @@ class ExecutionManager:
     async def cancel_market_orders(self, market_id: str, outcome_id: str | None = None) -> int:
         open_orders = await self.repo.get_open_orders(market_id=market_id, outcome_id=outcome_id)
         canceled = 0
+        canceled_ids: list[str] = []
         for o in open_orders:
             if await self.exchange.cancel_order(o.order_id):
                 canceled += 1
-        await self.repo.bulk_update_order_status([o.order_id for o in open_orders], OrderStatus.CANCELED.value, str(utc_now()))
+                canceled_ids.append(o.order_id)
+        await self.repo.bulk_update_order_status(canceled_ids, OrderStatus.CANCELED.value, str(utc_now()))
         if canceled:
             await self.notifier.send(f"canceled {canceled} orders for market={market_id} outcome={outcome_id or '*'}")
         return canceled

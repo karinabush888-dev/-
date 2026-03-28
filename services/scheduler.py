@@ -18,6 +18,7 @@ class Scheduler:
         self.running = True
         self.last_fill_poll = None
         self.last_hour = None
+        self.pending_mispricing_entries: dict[str, dict[str, object]] = {}
 
     async def run(self) -> None:
         await self._load_mode_state()
@@ -92,6 +93,7 @@ class Scheduler:
         positions = await self.ctx.exchange.fetch_positions()
         self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in positions}
         open_orders = await self.ctx.exchange.fetch_open_orders()
+        open_order_ids = {o.order_id for o in open_orders}
 
         for market_id, outcome_id in self.ctx.state.selected_outcomes.items():
             res = await self.ctx.exchange.get_market_resolution_time(market_id)
@@ -137,16 +139,34 @@ class Scheduler:
                     and exp < sizing.max_exposure_per_outcome
                 ):
                     px = book.best_ask if sig == Side.BUY else book.best_bid
-                    await self.ctx.exec.place_limit(market_id, outcome_id, sig, px, sizing.order_size_mis)
-                    self.ctx.mis.start_trade(market_id, outcome_id, sig, px, sizing.order_size_mis)
-                    self.ctx.state.stats.mispricing_trades_today += 1
+                    entry_order = await self.ctx.exec.place_limit(market_id, outcome_id, sig, px, sizing.order_size_mis)
+                    self.pending_mispricing_entries[entry_order.order_id] = {
+                        "market_id": market_id,
+                        "outcome_id": outcome_id,
+                        "side": sig,
+                    }
 
         fills = await self.ctx.exchange.fetch_fills(self.last_fill_poll)
         self.last_fill_poll = now
         for f in fills:
             await self.ctx.repo.insert_fill(f)
             self.ctx.state.stats.trades_today += 1
+            pending_entry = self.pending_mispricing_entries.get(f.order_id)
+            if pending_entry:
+                market_id = pending_entry["market_id"]
+                outcome_id = pending_entry["outcome_id"]
+                side = pending_entry["side"]
+                had_active_trade = self.ctx.mis.has_active_trade(market_id, outcome_id)
+                self.ctx.mis.record_entry_fill(market_id, outcome_id, side, f.price, f.size)
+                if not had_active_trade:
+                    self.ctx.state.stats.mispricing_trades_today += 1
+                    await self.ctx.notifier.send(
+                        f"mispricing entry filled market={market_id} outcome={outcome_id} size={f.size}"
+                    )
             await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
+        stale_pending = [oid for oid in self.pending_mispricing_entries if oid not in open_order_ids]
+        for oid in stale_pending:
+            self.pending_mispricing_entries.pop(oid, None)
 
         cash = await self.ctx.exchange.fetch_balance()
         equity, drawdown = self.ctx.pnl_engine.mark_to_market(cash, list(self.ctx.state.positions.values()), mids)
