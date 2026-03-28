@@ -19,6 +19,7 @@ class Scheduler:
         self.last_fill_poll = None
         self.last_hour = None
         self.processed_fill_ids: set[str] = set()
+        self.inserted_fill_ids_this_run: set[str] = set()
         self.last_position_snapshot_sig: dict[tuple[str, str], tuple[float, float, float, float, float]] = {}
         self._last_mis_mm_pause_log_ts: dict[tuple[str, str], datetime] = {}
         self._last_pause_log_ts: datetime | None = None
@@ -250,9 +251,19 @@ class Scheduler:
             if f.fill_id in self.processed_fill_ids:
                 continue
             inserted = await self.ctx.repo.insert_fill(f)
-            if not inserted:
+            if inserted:
+                self.inserted_fill_ids_this_run.add(f.fill_id)
+            elif f.fill_id not in self.inserted_fill_ids_this_run:
                 log.info(
-                    "duplicate fill detected; reconciling downstream state fill_id=%s order_id=%s",
+                    "duplicate fill detected from persisted history; skipping replay fill_id=%s order_id=%s",
+                    f.fill_id,
+                    f.order_id,
+                )
+                self.processed_fill_ids.add(f.fill_id)
+                continue
+            else:
+                log.info(
+                    "duplicate fill detected after partial processing; reconciling downstream state fill_id=%s order_id=%s",
                     f.fill_id,
                     f.order_id,
                 )
@@ -264,34 +275,46 @@ class Scheduler:
                 log.warning("fill received for unknown order_id=%s fill_id=%s", f.order_id, f.fill_id)
             self.ctx.state.stats.trades_today += 1
             mis_state = self.ctx.mis.apply_fill(f)
+            notifications: list[tuple[str, str | None, int | None]] = []
             if mis_state:
                 if bool(mis_state.get("opened")):
                     self.ctx.state.stats.mispricing_trades_today += 1
-                    await self.ctx.notifier.send(
-                        f"mispricing trade opened market={f.market_id} outcome={f.outcome_id} side={f.side.value} entry={float(mis_state.get('entry_price', 0.0)):.4f}",
-                        dedupe_key=f"mis_open:{f.market_id}:{f.outcome_id}:{self.ctx.state.stats.day_key}",
-                        dedupe_ttl_sec=1800,
+                    notifications.append(
+                        (
+                            f"mispricing trade opened market={f.market_id} outcome={f.outcome_id} side={f.side.value} entry={float(mis_state.get('entry_price', 0.0)):.4f}",
+                            f"mis_open:{f.market_id}:{f.outcome_id}:{self.ctx.state.stats.day_key}",
+                            1800,
+                        )
                     )
                 exit_event = str(mis_state.get("exit_event") or "")
                 if exit_event:
-                    await self.ctx.notifier.send(
-                        f"mispricing exit filled market={f.market_id} outcome={f.outcome_id} reason={exit_event} remaining={float(mis_state.get('remaining_size', 0.0)):.4f}",
-                        dedupe_key=f"mis_exit_fill:{f.market_id}:{f.outcome_id}:{exit_event}",
-                        dedupe_ttl_sec=300,
+                    notifications.append(
+                        (
+                            f"mispricing exit filled market={f.market_id} outcome={f.outcome_id} reason={exit_event} remaining={float(mis_state.get('remaining_size', 0.0)):.4f}",
+                            f"mis_exit_fill:{f.market_id}:{f.outcome_id}:{exit_event}",
+                            300,
+                        )
                     )
                 if bool(mis_state.get("closed")):
                     close_reason = "stop" if bool(mis_state.get("stop_hit")) else "time_stop" if bool(mis_state.get("time_stop_hit")) else "tp"
-                    await self.ctx.notifier.send(
-                        f"mispricing trade closed market={f.market_id} outcome={f.outcome_id} reason={close_reason}",
-                        dedupe_key=f"mis_closed:{f.market_id}:{f.outcome_id}:{close_reason}:{self.ctx.state.stats.day_key}",
-                        dedupe_ttl_sec=86400,
+                    notifications.append(
+                        (
+                            f"mispricing trade closed market={f.market_id} outcome={f.outcome_id} reason={close_reason}",
+                            f"mis_closed:{f.market_id}:{f.outcome_id}:{close_reason}:{self.ctx.state.stats.day_key}",
+                            86400,
+                        )
                     )
                     log.info("mispricing trade closed market=%s outcome=%s reason=%s", f.market_id, f.outcome_id, close_reason)
                 if bool(mis_state.get("stopout_increment")):
                     self.ctx.state.stats.stopouts_today += 1
                     log.warning("mispricing stopout market=%s outcome=%s stopouts_today=%d", f.market_id, f.outcome_id, self.ctx.state.stats.stopouts_today)
-            await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
             self.processed_fill_ids.add(f.fill_id)
+            notifications.append((f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}", None, None))
+            for message, dedupe_key, dedupe_ttl_sec in notifications:
+                try:
+                    await self.ctx.notifier.send(message, dedupe_key=dedupe_key, dedupe_ttl_sec=dedupe_ttl_sec)
+                except Exception as exc:
+                    log.warning("notifier send failed for fill_id=%s message=%s error=%s", f.fill_id, message, exc)
 
         if fills_seen > 0:
             await self._refresh_positions(reason="post_fill")
