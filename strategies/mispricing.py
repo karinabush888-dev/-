@@ -74,6 +74,8 @@ class MispricingStrategy:
                 continue
             if trade.closed or trade.remaining_size <= 0:
                 continue
+            if bool(trade.meta.get("final_close_applied", False)):
+                continue
             if trade.time_stop_deadline and trade.time_stop_deadline <= now:
                 continue
             restored[(trade.market_id, trade.outcome_id)] = trade
@@ -151,6 +153,8 @@ class MispricingStrategy:
         key = (market_id, outcome_id)
         trade = self.active_trades.get(key)
         if trade is None or trade.closed or trade.remaining_size <= 0:
+            return []
+        if bool(trade.meta.get("final_close_applied", False)):
             return []
         if trade.stop_hit or trade.time_stop_hit or trade.tp2_hit:
             return []
@@ -234,6 +238,19 @@ class MispricingStrategy:
         is_tracked_exit_fill = bool(exit_pending and exit_pending.get("order_id") == fill.order_id)
         exit_event: str | None = None
         stopout_increment = False
+        if fill.side != trade.side and not is_tracked_exit_fill:
+            # Ignore untracked opposite-side fills here; order/position reconciliation handles inventory truth.
+            # This prevents stale or replaced exit orders from double-applying to remaining_size.
+            return {
+                "opened": opened,
+                "closed": trade.closed,
+                "stop_hit": trade.stop_hit,
+                "time_stop_hit": trade.time_stop_hit,
+                "exit_event": None,
+                "stopout_increment": False,
+                "remaining_size": trade.remaining_size,
+                "entry_price": trade.entry_price,
+            }
         if fill.side != trade.side and is_tracked_exit_fill:
             closed_size = round(min(fill.size, trade.remaining_size), 4)
             if closed_size > 0:
@@ -265,6 +282,8 @@ class MispricingStrategy:
 
         if trade.remaining_size <= 0:
             trade.closed = True
+            trade.remaining_size = 0.0
+            trade.meta["final_close_applied"] = True
             self.pending_exit_orders.pop(key, None)
             self.active_trades.pop(key, None)
 

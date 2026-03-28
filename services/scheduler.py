@@ -26,7 +26,11 @@ class Scheduler:
     async def run(self) -> None:
         await self._load_mode_state()
         await self._load_mispricing_state()
-        await self.ctx.notifier.send(f"bot start mode={self.ctx.settings.env.mode.value}")
+        await self.ctx.notifier.send(
+            f"bot start mode={self.ctx.settings.env.mode.value}",
+            dedupe_key=f"startup:{self.ctx.settings.env.mode.value}:{self.ctx.settings.env.db_path}",
+            dedupe_ttl_sec=600,
+        )
         await self._select_markets()
         while self.running:
             try:
@@ -107,7 +111,28 @@ class Scheduler:
             reason = f"within prob_band=[{prob_min:.2f},{prob_max:.2f}] max_liquidity={out.volume:.0f}"
             log.info("configured market matched target_url=%s market_id=%s", target_url, market.market_id)
             log.info("selected outcome market=%s outcome=%s(%s) prob=%.4f volume=%.1f reason=%s", market.market_id, out.outcome_id, out.label, out.implied_prob, out.volume, reason)
-            await self.ctx.notifier.send(f"selected outcome {market.name}: {out.label} p={out.implied_prob:.2f} liq={out.volume:.0f}; reason={reason}")
+            await self.ctx.notifier.send(
+                f"selected outcome {market.name}: {out.label} p={out.implied_prob:.2f} liq={out.volume:.0f}; reason={reason}",
+                dedupe_key=f"selected_outcome:{market.market_id}:{out.outcome_id}:{self.ctx.state.stats.day_key}",
+                dedupe_ttl_sec=86400,
+            )
+
+    def _prune_stale_mispricing_trades(self) -> None:
+        # Recovery hardening: if an "active" mispricing trade has no actual position exposure,
+        # treat it as stale state and drop it to avoid resurrection after restart/crash windows.
+        stale_keys: list[tuple[str, str]] = []
+        for key, trade in self.ctx.mis.active_trades.items():
+            if trade.closed:
+                stale_keys.append(key)
+                continue
+            pos = self.ctx.state.positions.get(key)
+            qty = abs(float(pos.qty)) if pos else 0.0
+            if qty <= 1e-6 and trade.remaining_size > 0:
+                stale_keys.append(key)
+        for key in stale_keys:
+            self.ctx.mis.active_trades.pop(key, None)
+            self.ctx.mis.pending_exit_orders.pop(key, None)
+            log.warning("pruned stale mispricing trade with no position exposure market=%s outcome=%s", key[0], key[1])
 
     async def _tick(self):
         now = utc_now()
@@ -117,7 +142,12 @@ class Scheduler:
         if self.ctx.state.is_paused():
             if self._last_pause_log_ts is None or (now - self._last_pause_log_ts).total_seconds() >= 300:
                 until = self.ctx.state.pause_until.isoformat() if self.ctx.state.pause_until else "unknown"
-                log.info("risk pause active until=%s kill_switch_active=%s", until, self.ctx.state.kill_switch_active)
+                log.info(
+                    "risk pause active until=%s kill_switch_active=%s reason=%s",
+                    until,
+                    self.ctx.state.kill_switch_active,
+                    self.ctx.state.pause_reason or "unspecified",
+                )
                 self._last_pause_log_ts = now
             return
         self._last_pause_log_ts = None
@@ -125,6 +155,7 @@ class Scheduler:
         mids: dict[tuple[str, str], float] = {}
         positions = await self.ctx.exchange.fetch_positions()
         self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in positions}
+        self._prune_stale_mispricing_trades()
         await self.ctx.exec.reconcile_open_orders()
         open_orders = await self.ctx.exchange.fetch_open_orders()
 
@@ -233,7 +264,9 @@ class Scheduler:
                 if bool(mis_state.get("opened")):
                     self.ctx.state.stats.mispricing_trades_today += 1
                     await self.ctx.notifier.send(
-                        f"mispricing trade opened market={f.market_id} outcome={f.outcome_id} side={f.side.value} entry={float(mis_state.get('entry_price', 0.0)):.4f}"
+                        f"mispricing trade opened market={f.market_id} outcome={f.outcome_id} side={f.side.value} entry={float(mis_state.get('entry_price', 0.0)):.4f}",
+                        dedupe_key=f"mis_open:{f.market_id}:{f.outcome_id}:{self.ctx.state.stats.day_key}",
+                        dedupe_ttl_sec=1800,
                     )
                 exit_event = str(mis_state.get("exit_event") or "")
                 if exit_event:
@@ -244,11 +277,15 @@ class Scheduler:
                     )
                 if bool(mis_state.get("closed")):
                     close_reason = "stop" if bool(mis_state.get("stop_hit")) else "time_stop" if bool(mis_state.get("time_stop_hit")) else "tp"
-                    await self.ctx.notifier.send(f"mispricing trade closed market={f.market_id} outcome={f.outcome_id} reason={close_reason}")
+                    await self.ctx.notifier.send(
+                        f"mispricing trade closed market={f.market_id} outcome={f.outcome_id} reason={close_reason}",
+                        dedupe_key=f"mis_closed:{f.market_id}:{f.outcome_id}:{close_reason}:{self.ctx.state.stats.day_key}",
+                        dedupe_ttl_sec=86400,
+                    )
                     log.info("mispricing trade closed market=%s outcome=%s reason=%s", f.market_id, f.outcome_id, close_reason)
                 if bool(mis_state.get("stopout_increment")):
                     self.ctx.state.stats.stopouts_today += 1
-                    log.warning("mispricing stopout market=%s outcome=%s", f.market_id, f.outcome_id)
+                    log.warning("mispricing stopout market=%s outcome=%s stopouts_today=%d", f.market_id, f.outcome_id, self.ctx.state.stats.stopouts_today)
             p = self.ctx.state.positions.get((f.market_id, f.outcome_id))
             if p:
                 log.info("position update market=%s outcome=%s qty=%.4f avg=%.4f rpnl=%.4f upnl=%.4f", p.market_id, p.outcome_id, p.qty, p.avg_price, p.realized_pnl, p.unrealized_pnl)
@@ -267,16 +304,22 @@ class Scheduler:
         self.ctx.pnl_state = {"equity": equity, "pnl_today": pnl_today, "pnl_mtd": pnl_mtd, "progress": progress, "drawdown": drawdown}
         log.info("pnl update equity=%.4f pnl_today=%.4f pnl_mtd=%.4f drawdown=%.4f", equity, pnl_today, pnl_mtd, drawdown)
 
-        if self.ctx.risk_engine.should_kill_switch(pnl_today, equity, self.ctx.state):
-            self.ctx.risk_engine.activate_pause_to_next_day(self.ctx.state)
+        kill_reason = self.ctx.risk_engine.kill_switch_reason(pnl_today, equity, self.ctx.state)
+        if kill_reason:
+            self.ctx.risk_engine.activate_pause_to_next_day(self.ctx.state, reason=kill_reason)
             await self.ctx.exec.cancel_all()
             pause_until = self.ctx.state.pause_until.isoformat() if self.ctx.state.pause_until else "unknown"
             await self.ctx.notifier.send(
-                f"kill switch activated; pause until next UTC day ({pause_until})",
+                f"kill switch activated reason={kill_reason}; pause until next UTC day ({pause_until})",
                 dedupe_key=f"kill_switch:{self.ctx.state.stats.day_key}",
                 dedupe_ttl_sec=3600,
             )
-            log.warning("kill switch activated pnl_today=%.4f equity=%.4f pause_until=%s", pnl_today, equity, pause_until)
+            await self.ctx.notifier.send(
+                f"trading paused until next UTC day ({pause_until}) reason={kill_reason}",
+                dedupe_key=f"pause_until_next_day:{self.ctx.state.stats.day_key}",
+                dedupe_ttl_sec=3600,
+            )
+            log.warning("kill switch activated reason=%s pnl_today=%.4f equity=%.4f pause_until=%s", kill_reason, pnl_today, equity, pause_until)
 
         await self.ctx.repo.snapshot_pnl(str(now), equity, pnl_today, pnl_mtd, progress, self.ctx.state.stats.mode.value, drawdown)
         await self._snapshot_positions(now)
@@ -286,6 +329,7 @@ class Scheduler:
             self.last_hour = now.hour
             await self.ctx.reporter.hourly(
                 {
+                    "ts": now.isoformat(),
                     "equity_now": equity,
                     "pnl_today": pnl_today,
                     "pnl_mtd": pnl_mtd,
@@ -306,6 +350,7 @@ class Scheduler:
         await self.ctx.repo.upsert_daily_metrics(old_day, self.ctx.state.stats.trades_today, self.ctx.state.stats.stopouts_today, self.ctx.state.stats.mispricing_trades_today, pnl_day)
         await self.ctx.reporter.daily(
             {
+                "day_key": old_day,
                 "equity_start": self.ctx.pnl_engine.equity_start_day,
                 "equity_end": prev_equity,
                 "pnl_day": pnl_day,
@@ -336,7 +381,11 @@ class Scheduler:
             )
         await self._persist_mode_state(mode, self.ctx.settings.risk.adaptation_window_hours)
         self.ctx.pnl_engine.reset_day(prev_equity)
-        await self.ctx.notifier.send(f"new UTC day, mode={mode.value}, next reset in {seconds_until_next_utc_day()} sec")
+        await self.ctx.notifier.send(
+            f"new UTC day, mode={mode.value}, next reset in {seconds_until_next_utc_day()} sec",
+            dedupe_key=f"utc_day_start:{self.ctx.state.stats.day_key}",
+            dedupe_ttl_sec=3600,
+        )
 
     async def _snapshot_positions(self, ts: datetime) -> None:
         for p in self.ctx.state.positions.values():

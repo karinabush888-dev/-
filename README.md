@@ -64,7 +64,7 @@ Startup emits explicit LIVE warnings because endpoint payload/status semantics a
 - **Risk controls:** kill switch on daily drawdown / stopout thresholds, explicit pause-until-next-UTC-day state/logging, and near-resolution market blocking with cancel/report hooks.
 - **Position/PnL chain:** exchange fills reconcile orders first, positions are refreshed after fill batches, and scheduler snapshots `positions_snapshots` + `pnl_snapshots` each cycle.
 - **Adaptation modes:** `NORMAL / ACCEL / BRAKE` are persisted with activation/expiry and restored on restart if still valid.
-- **Telegram reporting:** supports fill/order/report notifications with dedupe keys for key operational events (mispricing exits, kill switch, near-resolution blocks, adaptation mode transitions).
+- **Telegram reporting:** supports startup, configured market/outcome selection, mispricing exit lifecycle (TP1/TP2/stop/time-stop), kill-switch + pause notices, near-resolution blocks, mode transitions, hourly reports, and daily summaries with event dedupe keys to reduce duplicate spam.
 
 ## Inspect DB
 ```bash
@@ -79,6 +79,8 @@ docker compose down
 ```
 
 ## Still required before production deployment
+- This repository remains **PAPER-first** and should not be treated as real-money-ready.
+- LIVE endpoint behavior is still partially assumption-based until validated against your exact venue environment; warnings in logs are intentional and should not be removed.
 - Endpoint-by-endpoint LIVE contract verification (request/response schema, status enums, signing flow).
 - Reconciliation tests for partial fills, cancels, and cancel-all semantics against real venue behavior.
 - Dry-run/staging burn-in with alerting and manual supervision.

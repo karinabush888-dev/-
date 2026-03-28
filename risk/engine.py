@@ -20,18 +20,23 @@ class RiskEngine:
         max_exp = self.cfg.max_exposure_per_outcome_pct * equity
         return DynamicSizing(mm_alloc, mis_alloc, mm, mis, max_exp)
 
-    def should_kill_switch(self, pnl_today: float, equity: float, state: RuntimeState) -> bool:
-        if pnl_today <= -(self.cfg.daily_loss_limit_pct * equity):
-            return True
+    def kill_switch_reason(self, pnl_today: float, equity: float, state: RuntimeState) -> str | None:
+        daily_loss_limit_value = self.cfg.daily_loss_limit_pct * equity
+        if pnl_today <= -daily_loss_limit_value:
+            return f"daily_loss_limit breached pnl_today={pnl_today:.4f} limit=-{daily_loss_limit_value:.4f}"
         if state.stats.stopouts_today >= self.cfg.max_stopouts_per_day:
-            return True
-        return False
+            return f"max_stopouts_per_day reached stopouts_today={state.stats.stopouts_today} limit={self.cfg.max_stopouts_per_day}"
+        return None
 
-    def activate_pause_to_next_day(self, state: RuntimeState) -> None:
+    def should_kill_switch(self, pnl_today: float, equity: float, state: RuntimeState) -> bool:
+        return self.kill_switch_reason(pnl_today, equity, state) is not None
+
+    def activate_pause_to_next_day(self, state: RuntimeState, reason: str) -> None:
         now = utc_now()
         next_day = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         state.pause_until = next_day
         state.kill_switch_active = True
+        state.pause_reason = reason
 
     def near_resolution(self, resolution_ts, pause_before_resolution_minutes: int) -> bool:
         if resolution_ts is None:

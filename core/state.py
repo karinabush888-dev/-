@@ -14,6 +14,7 @@ class RuntimeState:
     open_order_ids: set[str] = field(default_factory=set)
     pause_until: datetime | None = None
     kill_switch_active: bool = False
+    pause_reason: str | None = None
     mispricing_trades: dict[tuple[str, str], MispricingTrade] = field(default_factory=dict)
     blocked_markets: dict[str, str] = field(default_factory=dict)
     stats: BotStats = field(default_factory=lambda: BotStats(day_key=utc_day_key()))
@@ -25,6 +26,7 @@ class RuntimeState:
         self.stats.mispricing_trades_today = 0
         self.kill_switch_active = False
         self.pause_until = None
+        self.pause_reason = None
 
     def is_paused(self) -> bool:
         return self.pause_until is not None and utc_now() < self.pause_until
