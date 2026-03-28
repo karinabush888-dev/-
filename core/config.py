@@ -80,14 +80,20 @@ class Settings(BaseModel):
 def _load_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"missing config file: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML in {path}: {exc}") from exc
 
 
 def load_settings() -> Settings:
     load_dotenv()
+    raw_mode = os.getenv("MODE", "PAPER").upper()
+    if raw_mode not in {BotMode.PAPER.value, BotMode.LIVE.value}:
+        raise ValueError(f"MODE must be PAPER or LIVE, got {raw_mode}")
     env = EnvConfig(
-        mode=BotMode(os.getenv("MODE", "PAPER").upper()),
+        mode=BotMode(raw_mode),
         telegram_enabled=os.getenv("TELEGRAM_ENABLED", "true").lower() == "true",
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -116,6 +122,12 @@ def load_settings() -> Settings:
     markets = MarketsConfig(**_load_yaml(markets_path))
     risk = RiskConfig(**_load_yaml(risk_path))
     settings = Settings(env=env, markets=markets, risk=risk)
+    if settings.env.refresh_sec <= 0:
+        raise ValueError("REFRESH_SEC must be > 0")
+    if settings.env.starting_equity <= 0:
+        raise ValueError("STARTING_EQUITY must be > 0")
+    if not settings.markets.markets:
+        raise ValueError("config/markets.yaml must contain at least one market entry")
     if settings.env.telegram_enabled and (not settings.env.telegram_bot_token or not settings.env.telegram_chat_id):
         raise ValueError("TELEGRAM_ENABLED=true requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
     if settings.env.mode == BotMode.LIVE:

@@ -13,8 +13,8 @@ class Repository:
     async def insert_order(self, o: Order) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO orders VALUES (?,?,?,?,?,?,?,?,?)",
-                (o.order_id, o.market_id, o.outcome_id, o.side.value, o.price, o.size, o.status.value, str(o.created_at), str(o.updated_at)),
+                "INSERT OR REPLACE INTO orders VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (o.order_id, o.market_id, o.outcome_id, o.side.value, o.price, o.size, o.filled_size, o.status.value, str(o.created_at), str(o.updated_at)),
             )
             await db.commit()
 
@@ -24,7 +24,7 @@ class Repository:
             await db.commit()
 
     async def get_open_orders(self, market_id: str | None = None, outcome_id: str | None = None) -> list[Order]:
-        query = "SELECT order_id, market_id, outcome_id, side, price, size, status, created_at, updated_at FROM orders WHERE status IN (?,?)"
+        query = "SELECT order_id, market_id, outcome_id, side, price, size, filled_size, status, created_at, updated_at FROM orders WHERE status IN (?,?)"
         params: list[object] = [OrderStatus.OPEN.value, OrderStatus.PARTIAL.value]
         if market_id:
             query += " AND market_id=?"
@@ -43,12 +43,35 @@ class Repository:
                 side=Side(r[3]),
                 price=float(r[4]),
                 size=float(r[5]),
-                status=OrderStatus(r[6]),
-                created_at=r[7],
-                updated_at=r[8],
+                filled_size=float(r[6] or 0.0),
+                status=OrderStatus(r[7]),
+                created_at=r[8],
+                updated_at=r[9],
             )
             for r in rows
         ]
+
+    async def apply_fill_to_order(self, order_id: str, fill_size: float, updated_at: str) -> tuple[float, float, str] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT size, filled_size, status FROM orders WHERE order_id=?", (order_id,))
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            total = float(row[0] or 0.0)
+            current = float(row[1] or 0.0)
+            new_filled = min(total, round(current + float(fill_size), 8))
+            if new_filled <= 0:
+                status = row[2]
+            elif new_filled + 1e-9 >= total:
+                status = OrderStatus.FILLED.value
+            else:
+                status = OrderStatus.PARTIAL.value
+            await db.execute(
+                "UPDATE orders SET filled_size=?, status=?, updated_at=? WHERE order_id=?",
+                (new_filled, status, updated_at, order_id),
+            )
+            await db.commit()
+            return total, new_filled, status
 
     async def bulk_update_order_status(self, order_ids: list[str], status: str, updated_at: str) -> None:
         if not order_ids:

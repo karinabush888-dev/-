@@ -14,6 +14,7 @@ CREATE_SQL = [
       side TEXT,
       price REAL,
       size REAL,
+      filled_size REAL DEFAULT 0,
       status TEXT,
       created_at TEXT,
       updated_at TEXT
@@ -89,4 +90,9 @@ async def init_db(path: str) -> None:
     async with aiosqlite.connect(path) as db:
         for q in CREATE_SQL:
             await db.execute(q)
+        # Lightweight migration for pre-existing databases.
+        cur = await db.execute("PRAGMA table_info(orders)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "filled_size" not in cols:
+            await db.execute("ALTER TABLE orders ADD COLUMN filled_size REAL DEFAULT 0")
         await db.commit()

@@ -126,20 +126,20 @@ class PaperExchangeClient(ExchangeClient):
             pos = Position(market_id=order.market_id, outcome_id=order.outcome_id)
             self.positions[key] = pos
         signed = fill_size if order.side == Side.BUY else -fill_size
-        if pos.qty == 0 or (pos.qty > 0 and signed > 0) or (pos.qty < 0 and signed < 0):
+        prev_qty = pos.qty
+        if prev_qty == 0 or (prev_qty > 0 and signed > 0) or (prev_qty < 0 and signed < 0):
             total_cost = pos.avg_price * abs(pos.qty) + fill.price * abs(signed)
             pos.qty += signed
             pos.avg_price = total_cost / abs(pos.qty) if pos.qty != 0 else 0.0
         else:
-            closing = min(abs(pos.qty), abs(signed))
-            pnl = closing * ((fill.price - pos.avg_price) if pos.qty > 0 else (pos.avg_price - fill.price))
+            closing = min(abs(prev_qty), abs(signed))
+            pnl = closing * ((fill.price - pos.avg_price) if prev_qty > 0 else (pos.avg_price - fill.price))
             pos.realized_pnl += pnl - fee
             pos.qty += signed
             if pos.qty == 0:
                 pos.avg_price = 0.0
-            elif (pos.qty > 0 and signed > 0) or (pos.qty < 0 and signed < 0):
-                # Position flipped direction on this fill; reset cost basis to fill price
-                # for the newly-opened remainder.
+            elif (prev_qty > 0 > pos.qty) or (prev_qty < 0 < pos.qty):
+                # Position flipped direction on this fill; reset cost basis to fill price.
                 pos.avg_price = fill.price
         cash_delta = -fill.size * fill.price - fee if order.side == Side.BUY else fill.size * fill.price - fee
         self.cash += cash_delta
