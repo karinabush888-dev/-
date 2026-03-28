@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -127,8 +127,8 @@ class LivePolymarketClient(ExchangeClient):
             size=float(o.get("size", req.size)),
             filled_size=float(o.get("filled_size", 0.0)),
             status=OrderStatus(str(o.get("status", "OPEN")).upper()),
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
 
     async def cancel_order(self, order_id: str) -> bool:
@@ -153,8 +153,8 @@ class LivePolymarketClient(ExchangeClient):
                     size=float(o.get("size", 0.0)),
                     filled_size=float(o.get("filled_size", 0.0)),
                     status=OrderStatus(str(o.get("status", "OPEN")).upper()),
-                    created_at=datetime.now(UTC),
-                    updated_at=datetime.now(UTC),
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
         return out
@@ -163,7 +163,7 @@ class LivePolymarketClient(ExchangeClient):
         data = await self._request("GET", "/fills")
         out: list[Fill] = []
         for f in data.get("data", data.get("fills", [])):
-            ts = datetime.fromisoformat(str(f.get("ts", datetime.now(UTC).isoformat())).replace("Z", "+00:00"))
+            ts = datetime.fromisoformat(str(f.get("ts", datetime.now(timezone.utc).isoformat())).replace("Z", "+00:00"))
             if since and ts <= since:
                 continue
             out.append(
@@ -183,11 +183,36 @@ class LivePolymarketClient(ExchangeClient):
 
     async def get_server_time(self) -> datetime:
         data = await self._request("GET", "/time")
-        val = data.get("iso", data.get("server_time", datetime.now(UTC).isoformat()))
+        val = data.get("iso", data.get("server_time", datetime.now(timezone.utc).isoformat()))
         return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
 
     async def get_market_resolution_time(self, market_id: str) -> datetime | None:
-        m = await self.fetch_market_detail(market_id)
-        if isinstance(m.event_url, str):
-            return None
+        data = await self._request("GET", f"/markets/{market_id}")
+        m = data.get("data", data)
+        candidates = (
+            m.get("resolution_time"),
+            m.get("resolve_time"),
+            m.get("resolved_at"),
+            m.get("end_date"),
+            m.get("endDate"),
+            m.get("end_time"),
+            m.get("endTime"),
+            m.get("expiration_time"),
+            m.get("expiry"),
+        )
+        for value in candidates:
+            if value in (None, ""):
+                continue
+            if isinstance(value, (int, float)):
+                try:
+                    return datetime.fromtimestamp(float(value), tz=timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    continue
+            if isinstance(value, str):
+                normalized = value.replace("Z", "+00:00")
+                try:
+                    parsed = datetime.fromisoformat(normalized)
+                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
         return None

@@ -137,6 +137,10 @@ class PaperExchangeClient(ExchangeClient):
             pos.qty += signed
             if pos.qty == 0:
                 pos.avg_price = 0.0
+            elif (pos.qty > 0 and signed > 0) or (pos.qty < 0 and signed < 0):
+                # Position flipped direction on this fill; reset cost basis to fill price
+                # for the newly-opened remainder.
+                pos.avg_price = fill.price
         cash_delta = -fill.size * fill.price - fee if order.side == Side.BUY else fill.size * fill.price - fee
         self.cash += cash_delta
 
