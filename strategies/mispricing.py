@@ -54,13 +54,15 @@ class MispricingStrategy:
 
     def register_exit_order(self, order_id: str, market_id: str, outcome_id: str, side: Side, reason: str, target_size: float) -> None:
         key = (market_id, outcome_id)
+        now_ts = utc_now().timestamp()
         self.pending_exit_orders[key] = {
             "order_id": order_id,
             "side": side,
             "reason": reason,
             "target_size": float(target_size),
             "filled_size": 0.0,
-            "placed_at_ts": utc_now().timestamp(),
+            "placed_at_ts": now_ts,
+            "last_progress_ts": now_ts,
         }
 
     def has_pending_entry(self, market_id: str, outcome_id: str) -> bool:
@@ -83,10 +85,13 @@ class MispricingStrategy:
         pending = self.pending_exit_orders.get(key)
         if not pending:
             return False
-        # Allow retry if pending exit has not made progress for a full refresh window * 3
+        # Allow retry if pending exit has not made progress for a full refresh window * 3.
+        # This intentionally applies even to partial fills so canceled/rejected remainders can be re-posted.
         stale_after = 90
-        age_sec = utc_now().timestamp() - float(pending["placed_at_ts"])
-        if age_sec > stale_after and float(pending["filled_size"]) <= 0:
+        now_ts = utc_now().timestamp()
+        last_progress_ts = float(pending.get("last_progress_ts", pending["placed_at_ts"]))
+        age_since_progress_sec = now_ts - last_progress_ts
+        if age_since_progress_sec > stale_after and float(pending["filled_size"]) < float(pending["target_size"]):
             self.pending_exit_orders.pop(key, None)
             return False
         return True
@@ -172,6 +177,7 @@ class MispricingStrategy:
             return None
 
         exit_pending = self.pending_exit_orders.get(key)
+        stop_hit_transition = False
         if fill.side != trade.side:
             closed_size = round(min(fill.size, trade.remaining_size), 4)
             if closed_size > 0:
@@ -186,10 +192,12 @@ class MispricingStrategy:
                     elif reason == "tp2":
                         trade.tp2_hit = True
                     elif reason == "stop":
+                        stop_hit_transition = not trade.stop_hit
                         trade.stop_hit = True
                     elif reason == "time_stop":
                         trade.time_stop_hit = True
 
+                    exit_pending["last_progress_ts"] = utc_now().timestamp()
                     if float(exit_pending["filled_size"]) + 1e-9 >= float(exit_pending["target_size"]):
                         self.pending_exit_orders.pop(key, None)
 
@@ -201,6 +209,7 @@ class MispricingStrategy:
             "opened": opened,
             "closed": trade.closed,
             "stop_hit": trade.stop_hit,
+            "stop_hit_transition": stop_hit_transition,
             "time_stop_hit": trade.time_stop_hit,
             "remaining_size": trade.remaining_size,
             "entry_price": trade.entry_price,

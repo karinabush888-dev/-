@@ -172,7 +172,7 @@ class Scheduler:
                 if bool(mis_state.get("closed")):
                     close_reason = "stop" if bool(mis_state.get("stop_hit")) else "time_stop" if bool(mis_state.get("time_stop_hit")) else "tp"
                     await self.ctx.notifier.send(f"mispricing trade closed market={f.market_id} outcome={f.outcome_id} reason={close_reason}")
-                if bool(mis_state.get("stop_hit")):
+                if bool(mis_state.get("stop_hit_transition")):
                     self.ctx.state.stats.stopouts_today += 1
             await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
 
