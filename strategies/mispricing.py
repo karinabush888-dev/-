@@ -81,10 +81,13 @@ class MispricingStrategy:
         return bool(trade and not trade.closed)
 
     def has_pending_exit(self, market_id: str, outcome_id: str) -> bool:
+        return self.get_stale_pending_exit_order_id(market_id, outcome_id) is None and (market_id, outcome_id) in self.pending_exit_orders
+
+    def get_stale_pending_exit_order_id(self, market_id: str, outcome_id: str) -> str | None:
         key = (market_id, outcome_id)
         pending = self.pending_exit_orders.get(key)
         if not pending:
-            return False
+            return None
         # Allow retry if pending exit has not made progress for a full refresh window * 3.
         # This intentionally applies even to partial fills so canceled/rejected remainders can be re-posted.
         stale_after = 90
@@ -92,8 +95,15 @@ class MispricingStrategy:
         last_progress_ts = float(pending.get("last_progress_ts", pending["placed_at_ts"]))
         age_since_progress_sec = now_ts - last_progress_ts
         if age_since_progress_sec > stale_after and float(pending["filled_size"]) < float(pending["target_size"]):
-            self.pending_exit_orders.pop(key, None)
+            return str(pending["order_id"])
+        return None
+
+    def clear_pending_exit_order(self, market_id: str, outcome_id: str, order_id: str) -> bool:
+        key = (market_id, outcome_id)
+        pending = self.pending_exit_orders.get(key)
+        if not pending or str(pending.get("order_id")) != order_id:
             return False
+        self.pending_exit_orders.pop(key, None)
         return True
 
     def manage_trade(self, market_id: str, outcome_id: str, current_price: float) -> list[MispricingExitAction]:

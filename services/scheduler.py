@@ -115,6 +115,15 @@ class Scheduler:
             sizing = self.ctx.risk_engine.dynamic_sizing(self.ctx.pnl_state["equity"], mode_mult_mm, mode_mult_mis)
 
             self.ctx.mis.on_tick(market_id, outcome_id, book.mid)
+            stale_exit_order_id = self.ctx.mis.get_stale_pending_exit_order_id(market_id, outcome_id)
+            if stale_exit_order_id:
+                canceled = await self.ctx.exec.cancel(stale_exit_order_id, reason="mispricing_exit_stale_retry")
+                if canceled:
+                    self.ctx.mis.clear_pending_exit_order(market_id, outcome_id, stale_exit_order_id)
+                    log.info("mispricing stale exit canceled market=%s outcome=%s order_id=%s", market_id, outcome_id, stale_exit_order_id)
+                else:
+                    log.warning("mispricing stale exit cancel failed market=%s outcome=%s order_id=%s", market_id, outcome_id, stale_exit_order_id)
+
             for action in self.ctx.mis.manage_trade(market_id, outcome_id, book.mid):
                 px = book.best_bid if action.side == Side.SELL else book.best_ask
                 exit_order = await self.ctx.exec.place_limit(market_id, outcome_id, action.side, px, action.size, tag="mis_exit")
