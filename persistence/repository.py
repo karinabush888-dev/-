@@ -83,13 +83,14 @@ class Repository:
             )
             await db.commit()
 
-    async def insert_fill(self, f: Fill) -> None:
+    async def insert_fill(self, f: Fill) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+            cur = await db.execute(
                 "INSERT OR IGNORE INTO fills VALUES (?,?,?,?,?,?,?,?,?)",
                 (f.fill_id, f.order_id, f.market_id, f.outcome_id, f.side.value, f.price, f.size, f.fee, str(f.ts)),
             )
             await db.commit()
+            return (cur.rowcount or 0) > 0
 
     async def snapshot_position(self, ts: str, p: Position, exposure: float) -> None:
         async with aiosqlite.connect(self.db_path) as db:
