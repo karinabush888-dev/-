@@ -43,6 +43,15 @@ class ExecutionManager:
         # Fallback reconciliation: if not open upstream anymore, close stale DB row to avoid OPEN drift.
         exchange_open_ids = {o.order_id for o in await self.exchange.fetch_open_orders()}
         if order_id not in exchange_open_ids:
+            order_state = await self.repo.get_order_state(order_id)
+            if order_state is not None:
+                total_size, filled_size, status = order_state
+                if status == OrderStatus.FILLED.value or (total_size > 0 and filled_size + 1e-9 >= total_size):
+                    self.order_tags.pop(order_id, None)
+                    await self.notifier.send(
+                        f"order cancel reconciliation skipped for filled order {order_id}{' reason=' + reason if reason else ''}"
+                    )
+                    return True
             await self.repo.upsert_order_status(order_id, OrderStatus.CANCELED.value, now)
             self.order_tags.pop(order_id, None)
             await self.notifier.send(f"order cancel reconciled {order_id}{' reason=' + reason if reason else ''}")

@@ -23,6 +23,14 @@ class Repository:
             await db.execute("UPDATE orders SET status=?, updated_at=? WHERE order_id=?", (status, updated_at, order_id))
             await db.commit()
 
+    async def get_order_state(self, order_id: str) -> tuple[float, float, str] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT size, filled_size, status FROM orders WHERE order_id=?", (order_id,))
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return float(row[0] or 0.0), float(row[1] or 0.0), str(row[2])
+
     async def get_open_orders(self, market_id: str | None = None, outcome_id: str | None = None) -> list[Order]:
         query = "SELECT order_id, market_id, outcome_id, side, price, size, filled_size, status, created_at, updated_at FROM orders WHERE status IN (?,?)"
         params: list[object] = [OrderStatus.OPEN.value, OrderStatus.PARTIAL.value]
