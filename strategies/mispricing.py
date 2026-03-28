@@ -172,26 +172,26 @@ class MispricingStrategy:
             return None
 
         exit_pending = self.pending_exit_orders.get(key)
-        if fill.side != trade.side:
+        is_tracked_exit_fill = bool(exit_pending and exit_pending.get("order_id") == fill.order_id)
+        if fill.side != trade.side and is_tracked_exit_fill:
             closed_size = round(min(fill.size, trade.remaining_size), 4)
             if closed_size > 0:
                 trade.remaining_size = round(max(0.0, trade.remaining_size - closed_size), 4)
-                if exit_pending and exit_pending.get("order_id") == fill.order_id:
-                    reason = str(exit_pending.get("reason"))
-                    exit_pending["filled_size"] = round(float(exit_pending.get("filled_size", 0.0)) + closed_size, 4)
-                    if reason == "tp1":
-                        trade.meta["tp1_filled"] = round(float(trade.meta.get("tp1_filled", 0.0)) + closed_size, 4)
-                        if float(trade.meta["tp1_filled"]) >= round(trade.size * self.cfg.mis_tp1_close_pct, 4):
-                            trade.tp1_hit = True
-                    elif reason == "tp2":
-                        trade.tp2_hit = True
-                    elif reason == "stop":
-                        trade.stop_hit = True
-                    elif reason == "time_stop":
-                        trade.time_stop_hit = True
+                reason = str(exit_pending.get("reason"))
+                exit_pending["filled_size"] = round(float(exit_pending.get("filled_size", 0.0)) + closed_size, 4)
+                if reason == "tp1":
+                    trade.meta["tp1_filled"] = round(float(trade.meta.get("tp1_filled", 0.0)) + closed_size, 4)
+                    if float(trade.meta["tp1_filled"]) >= round(trade.size * self.cfg.mis_tp1_close_pct, 4):
+                        trade.tp1_hit = True
+                elif reason == "tp2":
+                    trade.tp2_hit = True
+                elif reason == "stop":
+                    trade.stop_hit = True
+                elif reason == "time_stop":
+                    trade.time_stop_hit = True
 
-                    if float(exit_pending["filled_size"]) + 1e-9 >= float(exit_pending["target_size"]):
-                        self.pending_exit_orders.pop(key, None)
+                if float(exit_pending["filled_size"]) + 1e-9 >= float(exit_pending["target_size"]):
+                    self.pending_exit_orders.pop(key, None)
 
         if trade.remaining_size <= 0:
             trade.closed = True
