@@ -251,11 +251,12 @@ class Scheduler:
                 continue
             inserted = await self.ctx.repo.insert_fill(f)
             if not inserted:
-                log.info("duplicate fill ignored fill_id=%s order_id=%s", f.fill_id, f.order_id)
-                self.processed_fill_ids.add(f.fill_id)
-                continue
+                log.info(
+                    "duplicate fill detected; reconciling downstream state fill_id=%s order_id=%s",
+                    f.fill_id,
+                    f.order_id,
+                )
             fills_seen += 1
-            self.processed_fill_ids.add(f.fill_id)
             order_state = await self.ctx.repo.apply_fill_to_order(f.order_id, f.size, str(f.ts))
             if order_state:
                 log.info("order fill reconciled order_id=%s filled=%.4f/%.4f status=%s", f.order_id, order_state[1], order_state[0], order_state[2])
@@ -290,6 +291,7 @@ class Scheduler:
                     self.ctx.state.stats.stopouts_today += 1
                     log.warning("mispricing stopout market=%s outcome=%s stopouts_today=%d", f.market_id, f.outcome_id, self.ctx.state.stats.stopouts_today)
             await self.ctx.notifier.send(f"fill {f.fill_id} {f.side.value} {f.size}@{f.price}")
+            self.processed_fill_ids.add(f.fill_id)
 
         if fills_seen > 0:
             await self._refresh_positions(reason="post_fill")
