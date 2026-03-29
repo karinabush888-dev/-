@@ -87,6 +87,13 @@ class PaperExchangeClient(ExchangeClient):
 
     async def place_order(self, req: OrderRequest) -> Order:
         await asyncio.sleep(self.latency_ms / 1000)
+        requested_size = round(req.size, 4)
+        size = requested_size
+        if req.side == Side.SELL:
+            key = (req.market_id, req.outcome_id)
+            pos = self.positions.get(key)
+            held_qty = max(0.0, float(pos.qty)) if pos and pos.market_id else 0.0
+            size = round(min(requested_size, held_qty), 4)
         oid = str(uuid4())
         now = utc_now()
         order = Order(
@@ -95,12 +102,15 @@ class PaperExchangeClient(ExchangeClient):
             outcome_id=req.outcome_id,
             side=req.side,
             price=req.price,
-            size=req.size,
+            size=size,
             created_at=now,
             updated_at=now,
         )
+        if req.side == Side.SELL and size <= 0:
+            order.status = OrderStatus.CANCELED
         self.orders[oid] = order
-        await self._try_fill(order)
+        if order.status != OrderStatus.CANCELED:
+            await self._try_fill(order)
         return order
 
     async def _try_fill(self, order: Order) -> None:
@@ -115,6 +125,11 @@ class PaperExchangeClient(ExchangeClient):
             return
         frac = random.choice([0.25, 0.5, 1.0])
         fill_size = min(order.size - order.filled_size, round(order.size * frac, 4))
+        if order.side == Side.SELL:
+            key = (order.market_id, order.outcome_id)
+            pos = self.positions.get(key)
+            held_qty = max(0.0, float(pos.qty)) if pos and pos.market_id else 0.0
+            fill_size = min(fill_size, round(held_qty, 4))
         if fill_size <= 0:
             return
         fee = fill_size * order.price * 0.001
@@ -153,6 +168,11 @@ class PaperExchangeClient(ExchangeClient):
             elif (prev_qty > 0 > pos.qty) or (prev_qty < 0 < pos.qty):
                 # Position flipped direction on this fill; reset cost basis to fill price.
                 pos.avg_price = fill.price
+        if pos.qty < 0:
+            # PAPER model does not support explicit short inventory. Guard against accounting bugs.
+            pos.qty = 0.0
+            pos.avg_price = 0.0
+            pos.unrealized_pnl = 0.0
         cash_delta = -fill.size * fill.price - fee if order.side == Side.BUY else fill.size * fill.price - fee
         self.cash += cash_delta
 
