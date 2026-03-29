@@ -329,6 +329,7 @@ class Scheduler:
             )
             log.warning("kill switch activated reason=%s pnl_today=%.4f equity=%.4f pause_until=%s", kill_reason, pnl_today, equity, pause_until)
 
+        await self._snapshot_positions(now)
         await self.ctx.repo.snapshot_pnl(str(now), equity, pnl_today, pnl_mtd, progress, self.ctx.state.stats.mode.value, drawdown)
         log.info(
             "pnl snapshot written ts=%s equity=%.4f pnl_today=%.4f pnl_mtd=%.4f drawdown=%.4f",
@@ -338,7 +339,6 @@ class Scheduler:
             pnl_mtd,
             drawdown,
         )
-        await self._snapshot_positions(now)
         await self._persist_mispricing_state()
 
         if self.last_hour != now.hour:
@@ -416,7 +416,7 @@ class Scheduler:
             drift_vals: list[str] = []
             if sig[2] != round(abs(sig[0] * sig[1]), 8):
                 drift_vals.append("exposure")
-            if prev_sig and self._has_unexpected_position_drift(sig):
+            if prev_sig and self._has_unexpected_position_drift(prev_sig, sig):
                 log.warning(
                     "position snapshot drift detected market=%s outcome=%s prev=%s now=%s fields=%s",
                     p.market_id,
@@ -441,6 +441,8 @@ class Scheduler:
 
     async def _refresh_positions(self, *, reason: str) -> None:
         fresh_positions = await self.ctx.exchange.fetch_positions()
+        for p in fresh_positions:
+            self._normalize_position(p)
         self.ctx.state.positions = {(p.market_id, p.outcome_id): p for p in fresh_positions}
         log.info("positions refreshed reason=%s count=%d", reason, len(self.ctx.state.positions))
         for p in fresh_positions:
@@ -455,8 +457,11 @@ class Scheduler:
             )
 
     @staticmethod
-    def _has_unexpected_position_drift(sig: tuple[float, float, float, float, float]) -> bool:
-        # Normal fills should change qty/avg/rpnl/upnl over time; only flag impossible states.
+    def _has_unexpected_position_drift(
+        prev_sig: tuple[float, float, float, float, float],
+        sig: tuple[float, float, float, float, float],
+    ) -> bool:
+        # Normal fills and mark-to-market updates should evolve fields over time; only flag impossible states.
         qty, avg, exp, _, _ = sig
         if abs(qty) <= 1e-8 and (abs(avg) > 1e-8 or abs(exp) > 1e-8):
             return True
@@ -467,6 +472,13 @@ class Scheduler:
             if v != v or abs(v) > 1e12:
                 return True
         return False
+
+    @staticmethod
+    def _normalize_position(p) -> None:
+        if abs(float(p.qty)) <= 1e-8:
+            p.qty = 0.0
+            p.avg_price = 0.0
+            p.unrealized_pnl = 0.0
 
     async def shutdown(self):
         self.running = False
