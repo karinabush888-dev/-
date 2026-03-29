@@ -28,7 +28,12 @@ class ExecutionManager:
         o = await self.exchange.place_order(req)
         await self.repo.insert_order(o)
         self.order_tags[o.order_id] = tag
-        await self.notifier.send(f"order placed {o.order_id} {side.value} {size}@{price:.4f} {market_id}/{outcome_id} tag={tag}")
+        if o.status in {OrderStatus.CANCELED, OrderStatus.REJECTED}:
+            await self.notifier.send(
+                f"order not admitted {o.order_id} status={o.status.value} {side.value} {size}@{price:.4f} {market_id}/{outcome_id} tag={tag}"
+            )
+        else:
+            await self.notifier.send(f"order placed {o.order_id} {side.value} {size}@{price:.4f} {market_id}/{outcome_id} tag={tag}")
         return o
 
     async def cancel(self, order_id: str, *, reason: str = ""):

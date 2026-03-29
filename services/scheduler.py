@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 
 from core.timeutils import seconds_until_next_utc_day, utc_day_key, utc_now
-from core.types import AdaptationMode, Side
+from core.types import AdaptationMode, OrderStatus, Side
 from services.positions import exposure_of
 
 log = logging.getLogger(__name__)
@@ -187,13 +187,22 @@ class Scheduler:
             for action in self.ctx.mis.manage_trade(market_id, outcome_id, book.mid):
                 px = book.best_bid if action.side == Side.SELL else book.best_ask
                 exit_order = await self.ctx.exec.place_limit(market_id, outcome_id, action.side, px, action.size, tag="mis_exit")
-                self.ctx.mis.register_exit_order(exit_order.order_id, market_id, outcome_id, action.side, action.reason, action.size)
-                await self.ctx.notifier.send(
-                    f"mispricing exit trigger={action.reason} market={market_id} outcome={outcome_id} size={action.size}",
-                    dedupe_key=f"mis_exit_trigger:{market_id}:{outcome_id}:{action.reason}",
-                    dedupe_ttl_sec=max(30, self.ctx.settings.env.refresh_sec * 4),
-                )
-                log.info("mispricing exit triggered market=%s outcome=%s reason=%s size=%.4f", market_id, outcome_id, action.reason, action.size)
+                if exit_order.status not in {OrderStatus.CANCELED, OrderStatus.REJECTED}:
+                    self.ctx.mis.register_exit_order(exit_order.order_id, market_id, outcome_id, action.side, action.reason, action.size)
+                    await self.ctx.notifier.send(
+                        f"mispricing exit trigger={action.reason} market={market_id} outcome={outcome_id} size={action.size}",
+                        dedupe_key=f"mis_exit_trigger:{market_id}:{outcome_id}:{action.reason}",
+                        dedupe_ttl_sec=max(30, self.ctx.settings.env.refresh_sec * 4),
+                    )
+                    log.info("mispricing exit triggered market=%s outcome=%s reason=%s size=%.4f", market_id, outcome_id, action.reason, action.size)
+                else:
+                    log.info(
+                        "mispricing exit order not admitted market=%s outcome=%s side=%s status=%s",
+                        market_id,
+                        outcome_id,
+                        action.side.value,
+                        exit_order.status.value,
+                    )
 
             has_mis_context = (
                 self.ctx.mis.has_active_trade(market_id, outcome_id)
@@ -242,8 +251,17 @@ class Scheduler:
                     else:
                         px = book.best_ask if sig == Side.BUY else book.best_bid
                         entry_order = await self.ctx.exec.place_limit(market_id, outcome_id, sig, px, sizing.order_size_mis, tag="mis_entry")
-                        self.ctx.mis.register_entry_order(entry_order.order_id, market_id, outcome_id, sig)
-                        log.info("mispricing signal accepted market=%s outcome=%s side=%s price=%.4f size=%.4f", market_id, outcome_id, sig.value, px, sizing.order_size_mis)
+                        if entry_order.status not in {OrderStatus.CANCELED, OrderStatus.REJECTED}:
+                            self.ctx.mis.register_entry_order(entry_order.order_id, market_id, outcome_id, sig)
+                            log.info("mispricing signal accepted market=%s outcome=%s side=%s price=%.4f size=%.4f", market_id, outcome_id, sig.value, px, sizing.order_size_mis)
+                        else:
+                            log.info(
+                                "mispricing signal not admitted market=%s outcome=%s side=%s status=%s",
+                                market_id,
+                                outcome_id,
+                                sig.value,
+                                entry_order.status.value,
+                            )
 
         fills_seen = 0
         fills = await self.ctx.exchange.fetch_fills(self.last_fill_poll)
