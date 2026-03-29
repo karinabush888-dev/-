@@ -226,8 +226,10 @@ class Scheduler:
                             await self.ctx.exec.cancel(o.order_id, reason="mm_refresh")
                     if not reduce_only and exp < sizing.max_exposure_per_outcome:
                         await self.ctx.exec.place_limit(market_id, outcome_id, bside, bid, sizing.order_size_mm, tag="mm_quote")
-                    if (not reduce_only and exp < sizing.max_exposure_per_outcome) or (p and p.qty > 0):
-                        await self.ctx.exec.place_limit(market_id, outcome_id, sside, ask, sizing.order_size_mm, tag="mm_quote")
+                    available_qty = max(0.0, float(p.qty)) if p else 0.0
+                    if available_qty > 0:
+                        sell_size = min(sizing.order_size_mm, available_qty)
+                        await self.ctx.exec.place_limit(market_id, outcome_id, sside, ask, sell_size, tag="mm_quote")
 
                 sig = self.ctx.mis.detect_signal(market_id, outcome_id)
                 if sig:
