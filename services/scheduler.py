@@ -19,7 +19,6 @@ class Scheduler:
         self.last_fill_poll = None
         self.last_hour = None
         self.processed_fill_ids: set[str] = set()
-        self.last_position_snapshot_sig: dict[tuple[str, str], tuple[float, float, float, float, float]] = {}
         self._last_mis_mm_pause_log_ts: dict[tuple[str, str], datetime] = {}
         self._last_pause_log_ts: datetime | None = None
 
@@ -296,8 +295,9 @@ class Scheduler:
         if fills_seen > 0:
             await self._refresh_positions(reason="post_fill")
 
+        positions_final = list(self.ctx.state.positions.values())
         cash = await self.ctx.exchange.fetch_balance()
-        equity, drawdown = self.ctx.pnl_engine.mark_to_market(cash, list(self.ctx.state.positions.values()), mids)
+        equity, drawdown = self.ctx.pnl_engine.mark_to_market(cash, positions_final, mids)
         pnl_today = self.ctx.pnl_engine.pnl_today(equity)
         pnl_mtd = self.ctx.pnl_engine.pnl_mtd(equity)
         progress = self.ctx.pnl_engine.progress_to_goal_500(equity)
@@ -309,7 +309,7 @@ class Scheduler:
             pnl_today,
             pnl_mtd,
             drawdown,
-            len(self.ctx.state.positions),
+            len(positions_final),
         )
 
         kill_reason = self.ctx.risk_engine.kill_switch_reason(pnl_today, equity, self.ctx.state)
@@ -329,7 +329,7 @@ class Scheduler:
             )
             log.warning("kill switch activated reason=%s pnl_today=%.4f equity=%.4f pause_until=%s", kill_reason, pnl_today, equity, pause_until)
 
-        await self._snapshot_positions(now)
+        await self._snapshot_positions(now, positions_final)
         await self.ctx.repo.snapshot_pnl(str(now), equity, pnl_today, pnl_mtd, progress, self.ctx.state.stats.mode.value, drawdown)
         log.info(
             "pnl snapshot written ts=%s equity=%.4f pnl_today=%.4f pnl_mtd=%.4f drawdown=%.4f",
@@ -403,29 +403,19 @@ class Scheduler:
             dedupe_ttl_sec=3600,
         )
 
-    async def _snapshot_positions(self, ts: datetime) -> None:
-        for p in self.ctx.state.positions.values():
-            sig = (
-                round(float(p.qty), 8),
-                round(float(p.avg_price), 8),
-                round(float(exposure_of(p)), 8),
-                round(float(p.realized_pnl), 8),
-                round(float(p.unrealized_pnl), 8),
-            )
-            prev_sig = self.last_position_snapshot_sig.get((p.market_id, p.outcome_id))
-            drift_vals: list[str] = []
-            if sig[2] != round(abs(sig[0] * sig[1]), 8):
-                drift_vals.append("exposure")
-            if prev_sig and self._has_unexpected_position_drift(prev_sig, sig):
+    async def _snapshot_positions(self, ts: datetime, positions_final: list) -> None:
+        for p in positions_final:
+            sig = self._position_sig(p)
+            inconsistencies = self._position_inconsistencies(sig)
+            if inconsistencies:
                 log.warning(
-                    "position snapshot drift detected market=%s outcome=%s prev=%s now=%s fields=%s",
+                    "position snapshot drift detected market=%s outcome=%s sig=%s issues=%s",
                     p.market_id,
                     p.outcome_id,
-                    prev_sig,
                     sig,
-                    ",".join(drift_vals) if drift_vals else "unknown",
+                    "; ".join(inconsistencies),
                 )
-            await self.ctx.repo.snapshot_position(str(ts), p, exposure_of(p))
+            await self.ctx.repo.snapshot_position(str(ts), p, sig[2])
             log.info(
                 "position snapshot written ts=%s market=%s outcome=%s qty=%.4f avg=%.4f exp=%.4f rpnl=%.4f upnl=%.4f",
                 ts.isoformat(),
@@ -433,11 +423,10 @@ class Scheduler:
                 p.outcome_id,
                 p.qty,
                 p.avg_price,
-                exposure_of(p),
+                sig[2],
                 p.realized_pnl,
                 p.unrealized_pnl,
             )
-            self.last_position_snapshot_sig[(p.market_id, p.outcome_id)] = sig
 
     async def _refresh_positions(self, *, reason: str) -> None:
         fresh_positions = await self.ctx.exchange.fetch_positions()
@@ -457,21 +446,37 @@ class Scheduler:
             )
 
     @staticmethod
-    def _has_unexpected_position_drift(
-        prev_sig: tuple[float, float, float, float, float],
-        sig: tuple[float, float, float, float, float],
-    ) -> bool:
-        # Normal fills and mark-to-market updates should evolve fields over time; only flag impossible states.
-        qty, avg, exp, _, _ = sig
-        if abs(qty) <= 1e-8 and (abs(avg) > 1e-8 or abs(exp) > 1e-8):
-            return True
-        if abs(exp - abs(qty * avg)) > 1e-6:
-            return True
+    def _position_sig(p) -> tuple[float, float, float, float, float]:
+        return (
+            round(float(p.qty), 8),
+            round(float(p.avg_price), 8),
+            round(float(exposure_of(p)), 8),
+            round(float(p.realized_pnl), 8),
+            round(float(p.unrealized_pnl), 8),
+        )
+
+    @staticmethod
+    def _position_inconsistencies(sig: tuple[float, float, float, float, float]) -> list[str]:
+        issues: list[str] = []
+        qty, avg, exp, rpnl, upnl = sig
+        if abs(qty) <= 1e-8:
+            if abs(avg) > 1e-8:
+                issues.append(f"qty=0 but avg_price={avg:.8f} (expected 0)")
+            if abs(exp) > 1e-8:
+                issues.append(f"qty=0 but exposure={exp:.8f} (expected 0)")
+            if abs(upnl) > 1e-8:
+                issues.append(f"qty=0 but unrealized_pnl={upnl:.8f} (expected 0)")
+        expected_exp = round(abs(qty * avg), 8)
+        if abs(exp - expected_exp) > 1e-6:
+            issues.append(f"exposure mismatch exposure={exp:.8f} expected_abs_qty_x_avg={expected_exp:.8f}")
         # Detect NaN/inf-like numeric instability using self-inequality and huge bounds.
-        for v in sig:
-            if v != v or abs(v) > 1e12:
-                return True
-        return False
+        names = ("qty", "avg_price", "exposure", "realized_pnl", "unrealized_pnl")
+        for name, v in zip(names, (qty, avg, exp, rpnl, upnl)):
+            if v != v:
+                issues.append(f"{name} is NaN")
+            elif abs(v) > 1e12:
+                issues.append(f"{name} out_of_range={v:.8f}")
+        return issues
 
     @staticmethod
     def _normalize_position(p) -> None:
