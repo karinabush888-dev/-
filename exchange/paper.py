@@ -107,9 +107,9 @@ class PaperExchangeClient(ExchangeClient):
             updated_at=now,
         )
         if req.side == Side.SELL and size <= 0:
-            order.status = OrderStatus.CANCELED
+            order.status = OrderStatus.REJECTED
         self.orders[oid] = order
-        if order.status != OrderStatus.CANCELED:
+        if order.status not in {OrderStatus.CANCELED, OrderStatus.REJECTED}:
             await self._try_fill(order)
         return order
 
